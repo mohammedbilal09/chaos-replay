@@ -2,11 +2,11 @@
 
 ## Overview
 
-ChaosReplay is designed to become an end-to-end distributed failure reconstruction and fix-verification platform. Modern microservice and distributed systems suffer from rare, non-deterministic, and cascading failures that are notoriously difficult to capture, isolate, and debug. 
+ChaosReplay is designed to become an end-to-end distributed failure reconstruction and fix-verification platform. Modern microservice and distributed systems suffer from rare, non-deterministic, and cascading failures that are notoriously difficult to capture, isolate, and debug.
 
 ChaosReplay's long-term vision is to automatically ingest distributed runtime telemetry, reconstruct production incidents into minimal reproducible failure scenarios, replay them inside isolated environments with deterministic fault injection, and verify candidate code fixes before production release.
 
-> **Note**: ChaosReplay is being developed in deliberate engineering phases. The current codebase implements **Phase 1 — Foundation** only. Future capabilities (telemetry pipelines, replay engine, chaos injection, incident graphs, UI dashboards) will be built incrementally in subsequent phases.
+> **Note**: ChaosReplay is being developed in deliberate engineering phases. The current codebase implements **Phase 1 — Foundation** and **Phase 2 — Telemetry Ingestion**. Future capabilities (event correlation, replay engine, chaos injection, incident graphs, UI dashboards) will be built incrementally in subsequent phases.
 
 ---
 
@@ -23,240 +23,340 @@ Reproducing production bugs and catastrophic incidents in distributed systems is
 
 ## Current Status
 
-**Current Status: Phase 1 — Foundation**
+**Current Status: Phase 2 — Telemetry Ingestion**
 
-Phase 1 establishes the production-grade engineering foundation for the backend platform:
+Phase 2 introduces the first core domain capability of ChaosReplay — ingesting, validating, persisting, and querying distributed telemetry events:
 
-* **Spring Boot Application Architecture**: Structured with Java 21, Spring Boot 3.4, constructor-based dependency injection, and clean package separation.
-* **Health & Diagnostics API**: Typed endpoints (`/api/v1/health` and `/actuator/health`) reporting system availability and readiness.
-* **Database Foundation**: Spring Data JPA and PostgreSQL connection pool configuration ready for local development and containerization, parameterized via environment variables.
-* **Centralized Error Handling**: Global exception handler (`@RestControllerAdvice`) producing consistent, typed API error envelopes without leaking sensitive stack traces.
-* **Input Validation**: Reusable Jakarta Bean Validation integrated with automated error mapping.
-* **Local Containerization**: Multi-stage production `Dockerfile` with non-root security and a `docker-compose.yml` configuration managing isolated PostgreSQL storage.
-* **Automated Test Suite**: Independent, fast unit and API integration tests requiring no external database or embedded mock substitutes.
+* **Domain Model & Persistence**: Real `TelemetryEvent` entity mapped to PostgreSQL via Spring Data JPA and Hibernate 6.
+* **Flyway Database Migrations**: Version-controlled, deterministic database schema migration (`V1__create_telemetry_events.sql`) with schema validation (`ddl-auto: validate`).
+* **Optimized Index Architecture**: Targeted B-tree indexes for chronological sorting, service filtering, distributed tracing (`trace_id`), request correlation (`request_id`), and error triage (`event_type, severity`).
+* **JSONB Structured Metadata**: Rich contextual metadata stored as native PostgreSQL `JSONB` via Hibernate `@JdbcTypeCode(SqlTypes.JSON)`, avoiding brittle Java serialization blobs.
+* **Two-Tier Duplicate Protection**: Fast application-level check (`existsByEventId`) combined with authoritative database `UNIQUE` constraint on `event_id` to safeguard against concurrent race conditions (returning `409 Conflict`).
+* **Dynamic Specification Querying & Pagination**: Composable Criteria API specifications (`JpaSpecificationExecutor`) supporting multi-attribute filtering with bounded pagination (`PagedResponse`).
+* **Comprehensive Automated Tests**: Unit tests with Mockito, API slice tests (`@WebMvcTest`), and real PostgreSQL integration tests using Testcontainers.
 
 ---
 
 ## Architecture
 
-The following diagram illustrates the current Phase 1 foundation architecture:
+The following diagram illustrates the Phase 2 system architecture:
 
 ```mermaid
 flowchart TD
-    Client["Client / API Consumer"]
+    Client["Distributed Services / API Consumers"]
     
-    subgraph SpringBootApp["Spring Boot Application (port 8080)"]
-        API["REST Controllers<br/>/api/v1/health<br/>/actuator/health"]
-        ExceptionHandler["Global Exception Handler<br/>@RestControllerAdvice"]
-        JPA["Spring Data JPA / HikariCP"]
+    subgraph SpringBootApp["ChaosReplay Spring Boot Application (port 8080)"]
+        direction TB
+        subgraph APILayer["REST API Layer"]
+            HealthAPI["Health & Actuator APIs<br/>/api/v1/health<br/>/actuator/health"]
+            TelemetryAPI["Telemetry Controller<br/>POST /api/v1/telemetry/events<br/>GET /api/v1/telemetry/events"]
+            GlobalHandler["Global Exception Handler<br/>@RestControllerAdvice"]
+        end
         
-        API --> ExceptionHandler
-        API --> JPA
+        subgraph ServiceLayer["Service Layer"]
+            TelemetrySvc["Telemetry Service<br/>Validation & Duplicate Handling"]
+            QuerySpecs["Telemetry Specification Engine<br/>Criteria API Filters"]
+        end
+        
+        subgraph PersistenceLayer["Persistence Layer"]
+            Repo["Spring Data JPA Repository<br/>TelemetryEventRepository"]
+            Flyway["Flyway Migration Engine<br/>V1__create_telemetry_events.sql"]
+        end
+        
+        TelemetryAPI --> GlobalHandler
+        TelemetryAPI --> TelemetrySvc
+        TelemetrySvc --> QuerySpecs
+        TelemetrySvc --> Repo
     end
     
-    Postgres[("PostgreSQL 16<br/>(Docker Compose / port 5432)")]
+    subgraph Storage["Database (Docker / port 5432)"]
+        Postgres[("PostgreSQL 16<br/>JSONB & B-Tree Indexes")]
+        EventsTable[("telemetry_events<br/>Unique event_id<br/>Indexed timestamps & traces")]
+    end
     
-    Client -->|"HTTP Requests"| API
-    JPA -->|"JDBC Connection Pool"| Postgres
+    Client -->|"POST / GET Telemetry"| TelemetryAPI
+    Client -->|"Health Checks"| HealthAPI
+    Repo -->|"HikariCP JDBC"| Postgres
+    Flyway -.->|"DDL Migration"| Postgres
+    Postgres --> EventsTable
 ```
+
+---
+
+## Telemetry Domain Model
+
+Every field in the `TelemetryEvent` model is purposefully designed to support future failure reconstruction:
+
+| Field | Type | Required | Description & Future Phase Purpose |
+| :--- | :--- | :--- | :--- |
+| `id` | `BIGSERIAL` | Auto | Internal database surrogate primary key for efficient indexing. |
+| `eventId` | `VARCHAR(64)` | Yes | Unique producer-assigned identifier with unique constraint. Guarantees deduplication. |
+| `timestamp` | `TIMESTAMPTZ` | Yes | Precise UTC event occurrence time at producer (distinct from DB insertion time). Crucial for timeline reconstruction. |
+| `serviceName` | `VARCHAR(100)` | Yes | Originating microservice identifier (e.g. `order-service`). Forms service dependency graph nodes. |
+| `serviceInstance`| `VARCHAR(100)` | No | Specific node/pod/instance ID (e.g. `order-node-01`). Identifies replica-specific state corruption. |
+| `eventType` | `VARCHAR(32)` | Yes | Controlled category: `REQUEST`, `RESPONSE`, `ERROR`, `LOG`, `DATABASE`, `EXTERNAL_CALL`. |
+| `severity` | `VARCHAR(20)` | Yes | Controlled level: `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`. Enables threshold filtering during triage. |
+| `traceId` | `VARCHAR(64)` | No | Distributed trace identifier linking cross-service operations in Phase 3 (Event Correlation). |
+| `requestId` | `VARCHAR(64)` | No | Ingress HTTP/RPC request identifier for operation scoping. |
+| `operation` | `VARCHAR(255)` | No | Operation name or HTTP endpoint (e.g. `POST /payments`, `SELECT users`). |
+| `message` | `TEXT` | No | Human-readable log or diagnostic message. |
+| `metadata` | `JSONB` | No | Arbitrary contextual key-value payload (e.g. latencies, parameters, headers) queryable via JSONB operators. |
+| `createdAt` | `TIMESTAMPTZ` | Auto | Database record insertion timestamp in UTC (system audit trail). |
+
+---
+
+## Database Schema & Index Design
+
+The schema is maintained through Flyway (`V1__create_telemetry_events.sql`):
+
+```sql
+CREATE TABLE telemetry_events (
+    id BIGSERIAL PRIMARY KEY,
+    event_id VARCHAR(64) NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    service_name VARCHAR(100) NOT NULL,
+    service_instance VARCHAR(100),
+    event_type VARCHAR(32) NOT NULL,
+    severity VARCHAR(20) NOT NULL,
+    trace_id VARCHAR(64),
+    request_id VARCHAR(64),
+    operation VARCHAR(255),
+    message TEXT,
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT uq_telemetry_events_event_id UNIQUE (event_id)
+);
+```
+
+### Index Strategy
+
+1. **`uq_telemetry_events_event_id`**: Backed by a unique B-tree index. Provides \(O(1)\) deduplication checks and database-level concurrency protection.
+2. **`idx_telemetry_events_timestamp (timestamp DESC)`**: Optimizes chronological retrieval for incident timeline playback and windowed queries.
+3. **`idx_telemetry_events_service_timestamp (service_name, timestamp DESC)`**: Composite index supporting high-frequency queries for service-specific incident triage.
+4. **`idx_telemetry_events_trace_id (trace_id)`**: Enables instant retrieval of all distributed events for a given trace in Phase 3.
+5. **`idx_telemetry_events_request_id (request_id)`**: Enables isolating single-request causal chains.
+6. **`idx_telemetry_events_type_severity (event_type, severity)`**: Accelerates targeted filtering of critical failures.
+
+---
+
+## API Reference
+
+### 1. Ingest Telemetry Event
+
+Ingests a single telemetry event into the system.
+
+* **Endpoint**: `POST /api/v1/telemetry/events`
+* **Content-Type**: `application/json`
+* **Response Code**: `201 Created`
+
+**Request Example**:
+
+```json
+{
+  "eventId": "evt-001",
+  "timestamp": "2026-09-21T15:30:00Z",
+  "serviceName": "payment-service",
+  "serviceInstance": "payment-01",
+  "eventType": "ERROR",
+  "severity": "ERROR",
+  "traceId": "trace-123",
+  "requestId": "req-456",
+  "operation": "POST /payments",
+  "message": "Payment provider timeout",
+  "metadata": {
+    "provider": "example-provider",
+    "timeoutMs": 5000
+  }
+}
+```
+
+**Success Response (`201 Created`)**:
+
+```json
+{
+  "id": 1,
+  "eventId": "evt-001",
+  "timestamp": "2026-09-21T15:30:00Z",
+  "serviceName": "payment-service",
+  "serviceInstance": "payment-01",
+  "eventType": "ERROR",
+  "severity": "ERROR",
+  "traceId": "trace-123",
+  "requestId": "req-456",
+  "operation": "POST /payments",
+  "message": "Payment provider timeout",
+  "metadata": {
+    "provider": "example-provider",
+    "timeoutMs": 5000
+  },
+  "createdAt": "2026-09-21T15:30:01.123456Z"
+}
+```
+
+**Duplicate Rejection (`409 Conflict`)**:
+
+```json
+{
+  "timestamp": "2026-09-21T15:30:02.000Z",
+  "status": 409,
+  "error": "CONFLICT",
+  "message": "Telemetry event with eventId 'evt-001' already exists",
+  "path": "/api/v1/telemetry/events"
+}
+```
+
+---
+
+### 2. Query Telemetry Events
+
+Queries telemetry events with multi-criteria filtering and bounded pagination. Results are sorted by `timestamp DESC`.
+
+* **Endpoint**: `GET /api/v1/telemetry/events`
+* **Query Parameters**:
+  * `serviceName` *(string, optional)*: Filter by originating service.
+  * `eventType` *(enum, optional)*: `REQUEST`, `RESPONSE`, `ERROR`, `LOG`, `DATABASE`, `EXTERNAL_CALL`.
+  * `severity` *(enum, optional)*: `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`.
+  * `traceId` *(string, optional)*: Filter by distributed trace.
+  * `requestId` *(string, optional)*: Filter by request identifier.
+  * `from` *(ISO-8601 UTC string, optional)*: Filter events occurring at or after this instant.
+  * `to` *(ISO-8601 UTC string, optional)*: Filter events occurring at or before this instant.
+  * `page` *(int, optional, default: 0)*: Zero-based page number.
+  * `size` *(int, optional, default: 20, max: 100)*: Page size.
+* **Response Code**: `200 OK`
+
+**Example Request**:
+
+```bash
+curl -X GET "http://localhost:8080/api/v1/telemetry/events?serviceName=payment-service&severity=ERROR&page=0&size=20"
+```
+
+**Response (`200 OK`)**:
+
+```json
+{
+  "content": [
+    {
+      "id": 1,
+      "eventId": "evt-001",
+      "timestamp": "2026-09-21T15:30:00Z",
+      "serviceName": "payment-service",
+      "serviceInstance": "payment-01",
+      "eventType": "ERROR",
+      "severity": "ERROR",
+      "traceId": "trace-123",
+      "requestId": "req-456",
+      "operation": "POST /payments",
+      "message": "Payment provider timeout",
+      "metadata": {
+        "provider": "example-provider",
+        "timeoutMs": 5000
+      },
+      "createdAt": "2026-09-21T15:30:01.123456Z"
+    }
+  ],
+  "page": 0,
+  "size": 20,
+  "totalElements": 1,
+  "totalPages": 1,
+  "first": true,
+  "last": true
+}
+```
+
+---
+
+### 3. Service Health Endpoints
+
+* `GET /api/v1/health`: Basic service operational heartbeat.
+* `GET /actuator/health`: Production health probe reporting database connectivity, connection pool status, and disk space.
 
 ---
 
 ## Technology Stack
 
-The technologies implemented in Phase 1 are:
+The technologies implemented in Phase 1 & 2 are:
 
 * **Language**: Java 21 (LTS)
 * **Framework**: Spring Boot 3.4.2
 * **Web Layer**: Spring Web (Spring MVC)
 * **Operational Monitoring**: Spring Boot Actuator
-* **Data Persistence**: Spring Data JPA, Hibernate, PostgreSQL JDBC Driver
+* **Database & ORM**: PostgreSQL 16, Spring Data JPA, Hibernate 6 (`JSONB` mapping via `@JdbcTypeCode`)
+* **Database Migrations**: Flyway 10
 * **Connection Pooling**: HikariCP
 * **Validation**: Jakarta Bean Validation (Hibernate Validator)
 * **Build Tool**: Apache Maven (via Maven Wrapper `mvnw`)
-* **Testing**: JUnit 5, Spring Boot Test, MockMvc, AssertJ
+* **Testing**: JUnit 5, Spring Boot Test, Mockito, MockMvc, AssertJ, Testcontainers PostgreSQL
 * **Containerization**: Docker (multi-stage build), Docker Compose
 
 ---
 
-## Local Setup
+## Local Setup & Execution
 
 ### Prerequisites
 
 * Java 21 JDK installed
 * Docker and Docker Compose installed
 
-### 1. Clone the Repository
-
-```bash
-git clone https://github.com/mohammedbilal09/chaos-replay.git
-cd chaos-replay
-```
-
-### 2. Configure Environment Variables
-
-The application comes with sensible local development defaults. To override them, create a `.env` file from the provided `.env.example`:
-
-```bash
-cp .env.example .env
-```
-
-Key environment variables:
-
-| Variable | Description | Default |
-| :--- | :--- | :--- |
-| `POSTGRES_HOST` | Hostname for PostgreSQL instance | `localhost` |
-| `POSTGRES_PORT` | Port exposed by PostgreSQL | `5432` |
-| `POSTGRES_DB` | Database name | `chaosreplay` |
-| `POSTGRES_USER` | Database username | `chaosreplay` |
-| `POSTGRES_PASSWORD` | Database password | `chaosreplay` |
-| `JAVA_OPTS` | JVM memory and GC flags (for Docker) | `-XX:+UseG1GC -XX:MaxRAMPercentage=75.0` |
-
-### 3. Start PostgreSQL Database
-
-Start the PostgreSQL service using Docker Compose:
+### 1. Start PostgreSQL Container
 
 ```bash
 docker compose up -d
-```
-
-Verify that the database container is healthy:
-
-```bash
 docker compose ps
 ```
 
-### 4. Run the Spring Boot Application
-
-Run the application using the Maven wrapper with the `local` profile:
+### 2. Run the Application
 
 ```bash
 ./mvnw spring-boot:run
 ```
 
-The application will start on port `8080` and establish a connection pool to the local PostgreSQL container.
+The application starts on port `8080`, automatically executes Flyway migrations against PostgreSQL, and initializes HikariCP.
 
 ---
 
-## API
+## Automated Testing Suite
 
-### 1. Service Health Endpoint
-
-Returns the operational status and service identifier.
-
-* **Endpoint**: `GET /api/v1/health`
-* **Response Code**: `200 OK`
-* **Content-Type**: `application/json`
-
-**Example Response**:
-
-```json
-{
-  "status": "UP",
-  "service": "chaosreplay"
-}
-```
-
-### 2. Spring Boot Actuator Health Endpoint
-
-Returns application availability and component health status (including PostgreSQL connectivity when running under the local profile).
-
-* **Endpoint**: `GET /actuator/health`
-* **Response Code**: `200 OK`
-* **Content-Type**: `application/json`
-
-**Example Response**:
-
-```json
-{
-  "status": "UP",
-  "components": {
-    "db": {
-      "status": "UP",
-      "details": {
-        "database": "PostgreSQL",
-        "validationQuery": "isValid()"
-      }
-    },
-    "diskSpace": {
-      "status": "UP"
-    },
-    "ping": {
-      "status": "UP"
-    }
-  }
-}
-```
-
-### 3. Error Response Structure
-
-All unhandled exceptions and validation errors return a consistent, typed JSON payload:
-
-```json
-{
-  "timestamp": "2026-09-21T15:30:00.000Z",
-  "status": 400,
-  "error": "BAD_REQUEST",
-  "message": "probeName must not be blank",
-  "path": "/test/validation"
-}
-```
-
----
-
-## Testing
-
-Execute the automated test suite using the Maven wrapper:
+Run the full automated test suite (26 tests including Testcontainers PostgreSQL integration tests):
 
 ```bash
-./mvnw test
+./mvnw clean test
 ```
 
-The automated test suite runs under the `test` profile, executing isolated unit and API slice tests independently without requiring external database dependencies.
+### Test Hierarchy:
+1. **Unit Tests (`TelemetryServiceTest`)**: Fast business logic tests verifying duplicate detection, concurrency constraint propagation, and query parameter validation with Mockito.
+2. **Web Slice Tests (`TelemetryControllerTest`, `HealthControllerTest`, `ValidationTest`)**: Controller slice tests verifying HTTP contracts, JSON serialization/deserialization, bean validation, and error envelopes.
+3. **PostgreSQL Integration Tests (`TelemetryPostgresIntegrationTest`)**: Real end-to-end database tests against PostgreSQL 16 via Testcontainers, verifying Flyway migration execution, `JSONB` column mapping, unique index enforcement, and Criteria queries.
 
 ---
 
-## Build
+## Packaging & Docker
 
-Compile, test, and package the executable JAR:
+### Package JAR:
 
 ```bash
 ./mvnw clean package
 ```
 
-To package the JAR without running tests:
-
-```bash
-./mvnw clean package -DskipTests
-```
-
-### Build and Run with Docker
-
-To build the multi-stage production Docker image:
+### Build Production Docker Image:
 
 ```bash
 docker build -t chaosreplay:latest .
 ```
 
-To run the containerized application:
-
-```bash
-docker run -p 8080:8080 --name chaosreplay-app chaosreplay:latest
-```
-
 ---
 
-## Roadmap
+## Project Roadmap
 
 * **Phase 1 — Foundation** *(Completed)*
-* **Phase 2 — Telemetry Ingestion**
-* **Phase 3 — Event Correlation**
-* **Phase 4 — Incident Reconstruction**
-* **Phase 5 — Service Dependency Graph**
-* **Phase 6 — Minimal Reproduction Engine**
-* **Phase 7 — Isolated Replay Engine**
-* **Phase 8 — Chaos Injection**
-* **Phase 9 — Candidate Fix Verification**
-* **Phase 10 — Observability**
-* **Phase 11 — Angular Incident Dashboard**
-* **Phase 12 — Kubernetes/AWS Deployment**
+* **Phase 2 — Telemetry Ingestion** *(Completed)*
+* **Phase 3 — Event Correlation** *(Upcoming)*
+* **Phase 4 — Incident Reconstruction** *(Upcoming)*
+* **Phase 5 — Service Dependency Graph** *(Upcoming)*
+* **Phase 6 — Minimal Reproduction Engine** *(Upcoming)*
+* **Phase 7 — Isolated Replay Engine** *(Upcoming)*
+* **Phase 8 — Chaos Injection** *(Upcoming)*
+* **Phase 9 — Candidate Fix Verification** *(Upcoming)*
+* **Phase 10 — Observability** *(Upcoming)*
+* **Phase 11 — Angular Incident Dashboard** *(Upcoming)*
+* **Phase 12 — Kubernetes/AWS Deployment** *(Upcoming)*
