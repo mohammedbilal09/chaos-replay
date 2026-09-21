@@ -4,9 +4,9 @@
 
 ChaosReplay is designed to become an end-to-end distributed failure reconstruction and fix-verification platform. Modern microservice and distributed systems suffer from rare, non-deterministic, and cascading failures that are notoriously difficult to capture, isolate, and debug.
 
-ChaosReplay's long-term vision is to automatically ingest distributed runtime telemetry, reconstruct production incidents into minimal reproducible failure scenarios, replay them inside isolated environments with deterministic fault injection, and verify candidate code fixes before production release.
+ChaosReplay's long-term vision is to automatically ingest distributed runtime telemetry, correlate cross-service events into deterministic execution timelines, reconstruct production incidents into minimal reproducible failure scenarios, replay them inside isolated environments with deterministic fault injection, and verify candidate code fixes before production release.
 
-> **Note**: ChaosReplay is being developed in deliberate engineering phases. The current codebase implements **Phase 1 — Foundation** and **Phase 2 — Telemetry Ingestion**. Future capabilities (event correlation, replay engine, chaos injection, incident graphs, UI dashboards) will be built incrementally in subsequent phases.
+> **Note**: ChaosReplay is being developed in deliberate engineering phases. The current codebase implements **Phase 1 — Foundation**, **Phase 2 — Telemetry Ingestion**, and **Phase 3 — Telemetry Correlation & Failure Reconstruction**. Future capabilities (service dependency graphs, replay engine, chaos injection, incident graphs, UI dashboards) will be built incrementally in subsequent phases.
 
 ---
 
@@ -23,23 +23,22 @@ Reproducing production bugs and catastrophic incidents in distributed systems is
 
 ## Current Status
 
-**Current Status: Phase 2 — Telemetry Ingestion**
+**Current Status: Phase 3 — Telemetry Correlation & Failure Reconstruction**
 
-Phase 2 introduces the first core domain capability of ChaosReplay — ingesting, validating, persisting, and querying distributed telemetry events:
+Phase 3 builds upon the telemetry ingestion foundation to reconstruct distributed execution traces and analyze failure lifecycles:
 
-* **Domain Model & Persistence**: Real `TelemetryEvent` entity mapped to PostgreSQL via Spring Data JPA and Hibernate 6.
-* **Flyway Database Migrations**: Version-controlled, deterministic database schema migration (`V1__create_telemetry_events.sql`) with schema validation (`ddl-auto: validate`).
-* **Optimized Index Architecture**: Targeted B-tree indexes for chronological sorting, service filtering, distributed tracing (`trace_id`), request correlation (`request_id`), and error triage (`event_type, severity`).
-* **JSONB Structured Metadata**: Rich contextual metadata stored as native PostgreSQL `JSONB` via Hibernate `@JdbcTypeCode(SqlTypes.JSON)`, avoiding brittle Java serialization blobs.
-* **Two-Tier Duplicate Protection**: Fast application-level check (`existsByEventId`) combined with authoritative database `UNIQUE` constraint on `event_id` to safeguard against concurrent race conditions (returning `409 Conflict`).
-* **Dynamic Specification Querying & Pagination**: Composable Criteria API specifications (`JpaSpecificationExecutor`) supporting multi-attribute filtering with bounded pagination (`PagedResponse`).
-* **Comprehensive Automated Tests**: Unit tests with Mockito, API slice tests (`@WebMvcTest`), and real PostgreSQL integration tests using Testcontainers.
+* **Distributed Trace Correlation (`GET /api/v1/traces/{traceId}`)**: Assembles all telemetry events belonging to a distributed trace across services, sorted deterministically by occurrence timestamp ascending (`timestamp ASC, event_id ASC`). Computes trace-level aggregates: `eventCount`, `hasErrors`, `highestSeverity`, and ordered distinct `services`.
+* **Ingress Request Correlation (`GET /api/v1/requests/{requestId}`)**: Groups telemetry events by single ingress request identifier to isolate end-to-end request lifecycles.
+* **Deterministic Failure Reconstruction (`GET /api/v1/traces/{traceId}/reconstruction`)**: Reconstructs the complete execution timeline and computes exact duration metrics (`startTime`, `endTime`, `durationMs`). Automatically detects failures (`severity == ERROR || severity == FATAL || eventType == ERROR`), counts unique failure events, and isolates the precise `firstFailure` event in chronological order without speculative root-cause guessing.
+* **Consistent 404 Not Found Semantics**: Missing traces or requests return standardized `404 Not Found` error envelopes.
+* **Non-Mutating Pure Aggregation**: Telemetry entities remain immutable; correlation and reconstruction are purely query-time aggregations.
+* **Real Database Integration Testing**: Tested end-to-end against real PostgreSQL 16 via Testcontainers, verifying database-level deterministic tie-breaking and timeline reconstruction.
 
 ---
 
 ## Architecture
 
-The following diagram illustrates the Phase 2 system architecture:
+The following diagram illustrates the Phase 3 system architecture:
 
 ```mermaid
 flowchart TD
@@ -50,11 +49,14 @@ flowchart TD
         subgraph APILayer["REST API Layer"]
             HealthAPI["Health & Actuator APIs<br/>/api/v1/health<br/>/actuator/health"]
             TelemetryAPI["Telemetry Controller<br/>POST /api/v1/telemetry/events<br/>GET /api/v1/telemetry/events"]
+            TraceAPI["Trace Correlation Controller<br/>GET /api/v1/traces/{traceId}<br/>GET /api/v1/traces/{traceId}/reconstruction"]
+            RequestAPI["Request Correlation Controller<br/>GET /api/v1/requests/{requestId}"]
             GlobalHandler["Global Exception Handler<br/>@RestControllerAdvice"]
         end
         
         subgraph ServiceLayer["Service Layer"]
-            TelemetrySvc["Telemetry Service<br/>Validation & Duplicate Handling"]
+            TelemetrySvc["Telemetry Service<br/>Validation & Ingestion"]
+            CorrelationSvc["Trace Correlation Service<br/>Deterministic Ordering & Reconstruction"]
             QuerySpecs["Telemetry Specification Engine<br/>Criteria API Filters"]
         end
         
@@ -63,10 +65,17 @@ flowchart TD
             Flyway["Flyway Migration Engine<br/>V1__create_telemetry_events.sql"]
         end
         
+        TraceAPI --> GlobalHandler
+        RequestAPI --> GlobalHandler
         TelemetryAPI --> GlobalHandler
+        
         TelemetryAPI --> TelemetrySvc
+        TraceAPI --> CorrelationSvc
+        RequestAPI --> CorrelationSvc
+        
         TelemetrySvc --> QuerySpecs
         TelemetrySvc --> Repo
+        CorrelationSvc --> Repo
     end
     
     subgraph Storage["Database (Docker / port 5432)"]
@@ -75,6 +84,8 @@ flowchart TD
     end
     
     Client -->|"POST / GET Telemetry"| TelemetryAPI
+    Client -->|"GET Trace / Reconstruction"| TraceAPI
+    Client -->|"GET Request Trace"| RequestAPI
     Client -->|"Health Checks"| HealthAPI
     Repo -->|"HikariCP JDBC"| Postgres
     Flyway -.->|"DDL Migration"| Postgres
@@ -85,58 +96,23 @@ flowchart TD
 
 ## Telemetry Domain Model
 
-Every field in the `TelemetryEvent` model is purposefully designed to support future failure reconstruction:
+Every field in the `TelemetryEvent` model is purposefully designed to support distributed tracing and failure reconstruction:
 
-| Field | Type | Required | Description & Future Phase Purpose |
+| Field | Type | Required | Description & Role in Reconstruction |
 | :--- | :--- | :--- | :--- |
 | `id` | `BIGSERIAL` | Auto | Internal database surrogate primary key for efficient indexing. |
-| `eventId` | `VARCHAR(64)` | Yes | Unique producer-assigned identifier with unique constraint. Guarantees deduplication. |
-| `timestamp` | `TIMESTAMPTZ` | Yes | Precise UTC event occurrence time at producer (distinct from DB insertion time). Crucial for timeline reconstruction. |
-| `serviceName` | `VARCHAR(100)` | Yes | Originating microservice identifier (e.g. `order-service`). Forms service dependency graph nodes. |
-| `serviceInstance`| `VARCHAR(100)` | No | Specific node/pod/instance ID (e.g. `order-node-01`). Identifies replica-specific state corruption. |
-| `eventType` | `VARCHAR(32)` | Yes | Controlled category: `REQUEST`, `RESPONSE`, `ERROR`, `LOG`, `DATABASE`, `EXTERNAL_CALL`. |
-| `severity` | `VARCHAR(20)` | Yes | Controlled level: `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`. Enables threshold filtering during triage. |
-| `traceId` | `VARCHAR(64)` | No | Distributed trace identifier linking cross-service operations in Phase 3 (Event Correlation). |
+| `eventId` | `VARCHAR(64)` | Yes | Unique producer-assigned identifier with unique constraint. Serves as tie-breaker for identical timestamps. |
+| `timestamp` | `TIMESTAMPTZ` | Yes | Precise UTC event occurrence time at producer. Forms chronological sorting baseline (`timestamp ASC`). |
+| `serviceName` | `VARCHAR(100)` | Yes | Originating microservice identifier (e.g. `order-service`). Tracks involved services in order of appearance. |
+| `serviceInstance`| `VARCHAR(100)` | No | Specific node/pod/instance ID (e.g. `order-node-01`). Pinpoints failing replica. |
+| `eventType` | `VARCHAR(32)` | Yes | Controlled category: `REQUEST`, `RESPONSE`, `ERROR`, `LOG`, `DATABASE`, `EXTERNAL_CALL`. `ERROR` triggers failure condition. |
+| `severity` | `VARCHAR(20)` | Yes | Controlled level: `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`. Levels `ERROR` and `FATAL` trigger failure condition. |
+| `traceId` | `VARCHAR(64)` | No | Distributed trace identifier linking cross-service operations. Primary key for trace correlation. |
 | `requestId` | `VARCHAR(64)` | No | Ingress HTTP/RPC request identifier for operation scoping. |
 | `operation` | `VARCHAR(255)` | No | Operation name or HTTP endpoint (e.g. `POST /payments`, `SELECT users`). |
 | `message` | `TEXT` | No | Human-readable log or diagnostic message. |
-| `metadata` | `JSONB` | No | Arbitrary contextual key-value payload (e.g. latencies, parameters, headers) queryable via JSONB operators. |
+| `metadata` | `JSONB` | No | Arbitrary contextual key-value payload (e.g. latencies, parameters, headers) stored as native JSONB. |
 | `createdAt` | `TIMESTAMPTZ` | Auto | Database record insertion timestamp in UTC (system audit trail). |
-
----
-
-## Database Schema & Index Design
-
-The schema is maintained through Flyway (`V1__create_telemetry_events.sql`):
-
-```sql
-CREATE TABLE telemetry_events (
-    id BIGSERIAL PRIMARY KEY,
-    event_id VARCHAR(64) NOT NULL,
-    timestamp TIMESTAMPTZ NOT NULL,
-    service_name VARCHAR(100) NOT NULL,
-    service_instance VARCHAR(100),
-    event_type VARCHAR(32) NOT NULL,
-    severity VARCHAR(20) NOT NULL,
-    trace_id VARCHAR(64),
-    request_id VARCHAR(64),
-    operation VARCHAR(255),
-    message TEXT,
-    metadata JSONB,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-    CONSTRAINT uq_telemetry_events_event_id UNIQUE (event_id)
-);
-```
-
-### Index Strategy
-
-1. **`uq_telemetry_events_event_id`**: Backed by a unique B-tree index. Provides \(O(1)\) deduplication checks and database-level concurrency protection.
-2. **`idx_telemetry_events_timestamp (timestamp DESC)`**: Optimizes chronological retrieval for incident timeline playback and windowed queries.
-3. **`idx_telemetry_events_service_timestamp (service_name, timestamp DESC)`**: Composite index supporting high-frequency queries for service-specific incident triage.
-4. **`idx_telemetry_events_trace_id (trace_id)`**: Enables instant retrieval of all distributed events for a given trace in Phase 3.
-5. **`idx_telemetry_events_request_id (request_id)`**: Enables isolating single-request causal chains.
-6. **`idx_telemetry_events_type_severity (event_type, severity)`**: Accelerates targeted filtering of critical failures.
 
 ---
 
@@ -152,23 +128,25 @@ Ingests a single telemetry event into the system.
 
 **Request Example**:
 
-```json
-{
-  "eventId": "evt-001",
-  "timestamp": "2026-09-21T15:30:00Z",
-  "serviceName": "payment-service",
-  "serviceInstance": "payment-01",
-  "eventType": "ERROR",
-  "severity": "ERROR",
-  "traceId": "trace-123",
-  "requestId": "req-456",
-  "operation": "POST /payments",
-  "message": "Payment provider timeout",
-  "metadata": {
-    "provider": "example-provider",
-    "timeoutMs": 5000
-  }
-}
+```bash
+curl -X POST http://localhost:8080/api/v1/telemetry/events \
+  -H "Content-Type: application/json" \
+  -d '{
+    "eventId": "evt-001",
+    "timestamp": "2026-09-21T15:30:00Z",
+    "serviceName": "payment-service",
+    "serviceInstance": "payment-01",
+    "eventType": "ERROR",
+    "severity": "ERROR",
+    "traceId": "trace-123",
+    "requestId": "req-456",
+    "operation": "POST /payments",
+    "message": "Payment provider timeout",
+    "metadata": {
+      "provider": "stripe",
+      "timeoutMs": 5000
+    }
+  }'
 ```
 
 **Success Response (`201 Created`)**:
@@ -187,22 +165,10 @@ Ingests a single telemetry event into the system.
   "operation": "POST /payments",
   "message": "Payment provider timeout",
   "metadata": {
-    "provider": "example-provider",
+    "provider": "stripe",
     "timeoutMs": 5000
   },
   "createdAt": "2026-09-21T15:30:01.123456Z"
-}
-```
-
-**Duplicate Rejection (`409 Conflict`)**:
-
-```json
-{
-  "timestamp": "2026-09-21T15:30:02.000Z",
-  "status": 409,
-  "error": "CONFLICT",
-  "message": "Telemetry event with eventId 'evt-001' already exists",
-  "path": "/api/v1/telemetry/events"
 }
 ```
 
@@ -213,60 +179,208 @@ Ingests a single telemetry event into the system.
 Queries telemetry events with multi-criteria filtering and bounded pagination. Results are sorted by `timestamp DESC`.
 
 * **Endpoint**: `GET /api/v1/telemetry/events`
-* **Query Parameters**:
-  * `serviceName` *(string, optional)*: Filter by originating service.
-  * `eventType` *(enum, optional)*: `REQUEST`, `RESPONSE`, `ERROR`, `LOG`, `DATABASE`, `EXTERNAL_CALL`.
-  * `severity` *(enum, optional)*: `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`.
-  * `traceId` *(string, optional)*: Filter by distributed trace.
-  * `requestId` *(string, optional)*: Filter by request identifier.
-  * `from` *(ISO-8601 UTC string, optional)*: Filter events occurring at or after this instant.
-  * `to` *(ISO-8601 UTC string, optional)*: Filter events occurring at or before this instant.
-  * `page` *(int, optional, default: 0)*: Zero-based page number.
-  * `size` *(int, optional, default: 20, max: 100)*: Page size.
+* **Query Parameters**: `serviceName`, `eventType`, `severity`, `traceId`, `requestId`, `from`, `to`, `page`, `size`
 * **Response Code**: `200 OK`
+
+---
+
+### 3. Correlate Trace Events
+
+Retrieves all telemetry events belonging to a distributed trace, ordered chronologically (`timestamp ASC, event_id ASC`).
+
+* **Endpoint**: `GET /api/v1/traces/{traceId}`
+* **Response Code**: `200 OK` (or `404 Not Found`)
 
 **Example Request**:
 
 ```bash
-curl -X GET "http://localhost:8080/api/v1/telemetry/events?serviceName=payment-service&severity=ERROR&page=0&size=20"
+curl http://localhost:8080/api/v1/traces/trace-123
 ```
 
 **Response (`200 OK`)**:
 
 ```json
 {
-  "content": [
+  "traceId": "trace-123",
+  "eventCount": 3,
+  "hasErrors": true,
+  "highestSeverity": "ERROR",
+  "services": [
+    "api-gateway",
+    "order-service",
+    "payment-service"
+  ],
+  "events": [
     {
       "id": 1,
       "eventId": "evt-001",
       "timestamp": "2026-09-21T15:30:00Z",
+      "serviceName": "api-gateway",
+      "serviceInstance": "gw-01",
+      "eventType": "REQUEST",
+      "severity": "INFO",
+      "traceId": "trace-123",
+      "requestId": "req-456",
+      "operation": "POST /checkout",
+      "message": "Incoming checkout request",
+      "metadata": null,
+      "createdAt": "2026-09-21T15:30:00.123456Z"
+    },
+    {
+      "id": 2,
+      "eventId": "evt-002",
+      "timestamp": "2026-09-21T15:30:01Z",
+      "serviceName": "order-service",
+      "serviceInstance": "ord-01",
+      "eventType": "REQUEST",
+      "severity": "INFO",
+      "traceId": "trace-123",
+      "requestId": "req-456",
+      "operation": "POST /orders",
+      "message": "Validating order",
+      "metadata": null,
+      "createdAt": "2026-09-21T15:30:01.123456Z"
+    },
+    {
+      "id": 3,
+      "eventId": "evt-003",
+      "timestamp": "2026-09-21T15:30:02Z",
       "serviceName": "payment-service",
-      "serviceInstance": "payment-01",
-      "eventType": "ERROR",
+      "serviceInstance": "pay-01",
+      "eventType": "EXTERNAL_CALL",
       "severity": "ERROR",
       "traceId": "trace-123",
       "requestId": "req-456",
-      "operation": "POST /payments",
+      "operation": "POST /charge",
       "message": "Payment provider timeout",
-      "metadata": {
-        "provider": "example-provider",
-        "timeoutMs": 5000
-      },
-      "createdAt": "2026-09-21T15:30:01.123456Z"
+      "metadata": { "provider": "stripe", "timeoutMs": 5000 },
+      "createdAt": "2026-09-21T15:30:02.123456Z"
     }
-  ],
-  "page": 0,
-  "size": 20,
-  "totalElements": 1,
-  "totalPages": 1,
-  "first": true,
-  "last": true
+  ]
 }
 ```
 
 ---
 
-### 3. Service Health Endpoints
+### 4. Correlate Request Events
+
+Retrieves all telemetry events scoped to a specific ingress request, ordered chronologically.
+
+* **Endpoint**: `GET /api/v1/requests/{requestId}`
+* **Response Code**: `200 OK` (or `404 Not Found`)
+
+**Example Request**:
+
+```bash
+curl http://localhost:8080/api/v1/requests/req-456
+```
+
+---
+
+### 5. Reconstruct Trace Execution Timeline
+
+Reconstructs the execution timeline, duration metrics, and deterministic failure diagnostics for a trace.
+
+* **Endpoint**: `GET /api/v1/traces/{traceId}/reconstruction`
+* **Response Code**: `200 OK` (or `404 Not Found`)
+
+**Example Request**:
+
+```bash
+curl http://localhost:8080/api/v1/traces/trace-123/reconstruction
+```
+
+**Response (`200 OK`)**:
+
+```json
+{
+  "traceId": "trace-123",
+  "eventCount": 3,
+  "services": [
+    "api-gateway",
+    "order-service",
+    "payment-service"
+  ],
+  "startTime": "2026-09-21T15:30:00Z",
+  "endTime": "2026-09-21T15:30:02Z",
+  "durationMs": 2000,
+  "hasFailure": true,
+  "failureCount": 1,
+  "firstFailure": {
+    "eventId": "evt-003",
+    "serviceName": "payment-service",
+    "serviceInstance": "pay-01",
+    "timestamp": "2026-09-21T15:30:02Z",
+    "eventType": "EXTERNAL_CALL",
+    "severity": "ERROR",
+    "operation": "POST /charge",
+    "message": "Payment provider timeout"
+  },
+  "timeline": [
+    {
+      "id": 1,
+      "eventId": "evt-001",
+      "timestamp": "2026-09-21T15:30:00Z",
+      "serviceName": "api-gateway",
+      "serviceInstance": "gw-01",
+      "eventType": "REQUEST",
+      "severity": "INFO",
+      "traceId": "trace-123",
+      "requestId": "req-456",
+      "operation": "POST /checkout",
+      "message": "Incoming checkout request",
+      "metadata": null,
+      "createdAt": "2026-09-21T15:30:00.123456Z"
+    },
+    {
+      "id": 2,
+      "eventId": "evt-002",
+      "timestamp": "2026-09-21T15:30:01Z",
+      "serviceName": "order-service",
+      "serviceInstance": "ord-01",
+      "eventType": "REQUEST",
+      "severity": "INFO",
+      "traceId": "trace-123",
+      "requestId": "req-456",
+      "operation": "POST /orders",
+      "message": "Validating order",
+      "metadata": null,
+      "createdAt": "2026-09-21T15:30:01.123456Z"
+    },
+    {
+      "id": 3,
+      "eventId": "evt-003",
+      "timestamp": "2026-09-21T15:30:02Z",
+      "serviceName": "payment-service",
+      "serviceInstance": "pay-01",
+      "eventType": "EXTERNAL_CALL",
+      "severity": "ERROR",
+      "traceId": "trace-123",
+      "requestId": "req-456",
+      "operation": "POST /charge",
+      "message": "Payment provider timeout",
+      "metadata": { "provider": "stripe", "timeoutMs": 5000 },
+      "createdAt": "2026-09-21T15:30:02.123456Z"
+    }
+  ]
+}
+```
+
+**Unknown Trace Error Response (`404 Not Found`)**:
+
+```json
+{
+  "timestamp": "2026-09-21T15:35:00.000000Z",
+  "status": 404,
+  "error": "NOT_FOUND",
+  "message": "Trace not found: unknown-trace-id",
+  "path": "/api/v1/traces/unknown-trace-id"
+}
+```
+
+---
+
+### 6. Service Health Endpoints
 
 * `GET /api/v1/health`: Basic service operational heartbeat.
 * `GET /actuator/health`: Production health probe reporting database connectivity, connection pool status, and disk space.
@@ -275,7 +389,7 @@ curl -X GET "http://localhost:8080/api/v1/telemetry/events?serviceName=payment-s
 
 ## Technology Stack
 
-The technologies implemented in Phase 1 & 2 are:
+The technologies implemented in Phases 1, 2 & 3 are:
 
 * **Language**: Java 21 (LTS)
 * **Framework**: Spring Boot 3.4.2
@@ -317,16 +431,16 @@ The application starts on port `8080`, automatically executes Flyway migrations 
 
 ## Automated Testing Suite
 
-Run the full automated test suite (26 tests including Testcontainers PostgreSQL integration tests):
+Run the full automated test suite (48 tests including Testcontainers PostgreSQL integration tests):
 
 ```bash
 ./mvnw clean test
 ```
 
 ### Test Hierarchy:
-1. **Unit Tests (`TelemetryServiceTest`)**: Fast business logic tests verifying duplicate detection, concurrency constraint propagation, and query parameter validation with Mockito.
-2. **Web Slice Tests (`TelemetryControllerTest`, `HealthControllerTest`, `ValidationTest`)**: Controller slice tests verifying HTTP contracts, JSON serialization/deserialization, bean validation, and error envelopes.
-3. **PostgreSQL Integration Tests (`TelemetryPostgresIntegrationTest`)**: Real end-to-end database tests against PostgreSQL 16 via Testcontainers, verifying Flyway migration execution, `JSONB` column mapping, unique index enforcement, and Criteria queries.
+1. **Unit Tests (`TelemetryServiceTest`, `TraceCorrelationServiceTest`)**: Fast business logic tests verifying duplicate detection, concurrency constraint propagation, query parameter validation, trace/request correlation, duration calculation, and deterministic first-failure extraction with Mockito.
+2. **Web Slice Tests (`TelemetryControllerTest`, `TraceCorrelationControllerTest`, `RequestCorrelationControllerTest`, `HealthControllerTest`, `ValidationTest`)**: Controller slice tests verifying HTTP contracts, JSON serialization/deserialization, 404 error envelopes, bean validation, and parameter binding via MockMvc.
+3. **PostgreSQL Integration Tests (`TelemetryPostgresIntegrationTest`, `CorrelationPostgresIntegrationTest`)**: Real end-to-end database tests against PostgreSQL 16 via Testcontainers, verifying Flyway migration execution, `JSONB` column mapping, unique index enforcement, database-level sorting (`ORDER BY timestamp ASC, event_id ASC`), and multi-service timeline reconstruction.
 
 ---
 
@@ -350,13 +464,12 @@ docker build -t chaosreplay:latest .
 
 * **Phase 1 — Foundation** *(Completed)*
 * **Phase 2 — Telemetry Ingestion** *(Completed)*
-* **Phase 3 — Event Correlation** *(Upcoming)*
-* **Phase 4 — Incident Reconstruction** *(Upcoming)*
-* **Phase 5 — Service Dependency Graph** *(Upcoming)*
-* **Phase 6 — Minimal Reproduction Engine** *(Upcoming)*
-* **Phase 7 — Isolated Replay Engine** *(Upcoming)*
-* **Phase 8 — Chaos Injection** *(Upcoming)*
-* **Phase 9 — Candidate Fix Verification** *(Upcoming)*
-* **Phase 10 — Observability** *(Upcoming)*
-* **Phase 11 — Angular Incident Dashboard** *(Upcoming)*
-* **Phase 12 — Kubernetes/AWS Deployment** *(Upcoming)*
+* **Phase 3 — Telemetry Correlation & Failure Reconstruction** *(Completed)*
+* **Phase 4 — Service Dependency Graph** *(Upcoming)*
+* **Phase 5 — Minimal Reproduction Engine** *(Upcoming)*
+* **Phase 6 — Isolated Replay Engine** *(Upcoming)*
+* **Phase 7 — Chaos Injection** *(Upcoming)*
+* **Phase 8 — Candidate Fix Verification** *(Upcoming)*
+* **Phase 9 — Observability (OTel/Prometheus/Grafana)** *(Upcoming)*
+* **Phase 10 — Angular Incident Dashboard** *(Upcoming)*
+* **Phase 11 — Kubernetes/AWS Deployment** *(Upcoming)*

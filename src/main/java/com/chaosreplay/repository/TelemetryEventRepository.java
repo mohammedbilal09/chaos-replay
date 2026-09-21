@@ -5,6 +5,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
 import org.springframework.stereotype.Repository;
 
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -31,5 +32,23 @@ public interface TelemetryEventRepository extends JpaRepository<TelemetryEvent, 
      * @return an Optional containing the event if found
      */
     Optional<TelemetryEvent> findByEventId(String eventId);
+
+    /**
+     * Finds all telemetry events for a specific traceId, ordered deterministically
+     * by occurrence timestamp ascending, with eventId ascending as the tie-breaker.
+     *
+     * @param traceId distributed trace identifier
+     * @return chronologically ordered list of events
+     */
+    List<TelemetryEvent> findAllByTraceIdOrderByTimestampAscEventIdAsc(String traceId);
+
+    /**
+     * Finds all telemetry events for a specific requestId, ordered deterministically
+     * by occurrence timestamp ascending, with eventId ascending as the tie-breaker.
+     *
+     * @param requestId ingress request identifier
+     * @return chronologically ordered list of events
+     */
+    List<TelemetryEvent> findAllByRequestIdOrderByTimestampAscEventIdAsc(String requestId);
 }
 
