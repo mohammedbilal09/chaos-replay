@@ -1,0 +1,28 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:chaosreplay}
+    username: ${POSTGRES_USER:chaosreplay}
+    password: ${POSTGRES_PASSWORD:chaosreplay}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      connection-timeout: 10000
+      maximum-pool-size: 10
+      minimum-idle: 2
+      idle-timeout: 30000
+      max-lifetime: 1800000
+      pool-name: ChaosReplayHikariPool
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+
+logging:
+  level:
+    root: INFO
+    com.chaosreplay: DEBUG
+    org.hibernate.SQL: INFO
+    com.zaxxer.hikari: INFO
+
