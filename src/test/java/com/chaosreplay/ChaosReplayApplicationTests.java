@@ -30,6 +30,15 @@ class ChaosReplayApplicationTests {
     @MockitoBean
     private ReplayVerificationDifferenceRepository replayVerificationDifferenceRepository;
 
+    @MockitoBean
+    private com.chaosreplay.repository.FailureAnalysisRepository failureAnalysisRepository;
+
+    @MockitoBean
+    private com.chaosreplay.repository.FailureAnalysisCandidateRepository failureAnalysisCandidateRepository;
+
+    @MockitoBean
+    private com.chaosreplay.repository.FailureAnalysisEvidenceRepository failureAnalysisEvidenceRepository;
+
     @Test
     @DisplayName("Application context starts successfully without external dependencies")
     void contextLoads() {

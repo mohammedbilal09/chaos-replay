@@ -42,6 +42,15 @@ class ActuatorHealthTest {
     @MockitoBean
     private ReplayVerificationDifferenceRepository replayVerificationDifferenceRepository;
 
+    @MockitoBean
+    private com.chaosreplay.repository.FailureAnalysisRepository failureAnalysisRepository;
+
+    @MockitoBean
+    private com.chaosreplay.repository.FailureAnalysisCandidateRepository failureAnalysisCandidateRepository;
+
+    @MockitoBean
+    private com.chaosreplay.repository.FailureAnalysisEvidenceRepository failureAnalysisEvidenceRepository;
+
     @Test
     @DisplayName("GET /actuator/health returns 200 with status UP")
     void actuatorHealth_returnsUp() throws Exception {
