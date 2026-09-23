@@ -1,5 +1,7 @@
 package com.chaosreplay.api;
 
+import com.chaosreplay.repository.ReplayScenarioEventRepository;
+import com.chaosreplay.repository.ReplayScenarioRepository;
 import com.chaosreplay.repository.TelemetryEventRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -25,6 +27,12 @@ class ActuatorHealthTest {
 
     @MockitoBean
     private TelemetryEventRepository telemetryEventRepository;
+
+    @MockitoBean
+    private ReplayScenarioRepository replayScenarioRepository;
+
+    @MockitoBean
+    private ReplayScenarioEventRepository replayScenarioEventRepository;
 
     @Test
     @DisplayName("GET /actuator/health returns 200 with status UP")

@@ -6,7 +6,7 @@ ChaosReplay is designed to become an end-to-end distributed failure reconstructi
 
 ChaosReplay's long-term vision is to automatically ingest distributed runtime telemetry, correlate cross-service events into deterministic execution timelines, reconstruct production incidents into minimal reproducible failure scenarios, replay them inside isolated environments with deterministic fault injection, and verify candidate code fixes before production release.
 
-> **Note**: ChaosReplay is being developed in deliberate engineering phases. The current codebase implements **Phase 1 — Foundation**, **Phase 2 — Telemetry Ingestion**, and **Phase 3 — Telemetry Correlation & Failure Reconstruction**. Future capabilities (service dependency graphs, replay engine, chaos injection, incident graphs, UI dashboards) will be built incrementally in subsequent phases.
+> **Note**: ChaosReplay is being developed in deliberate engineering phases. The current codebase implements **Phase 1 — Foundation**, **Phase 2 — Telemetry Ingestion**, **Phase 3 — Telemetry Correlation & Failure Reconstruction**, and **Phase 4 — Deterministic Failure Replay & Scenario Generation**. Future capabilities (service dependency graphs, minimal reproduction engine, chaos injection, incident graphs, UI dashboards) will be built incrementally in subsequent phases.
 
 ---
 
@@ -23,198 +23,180 @@ Reproducing production bugs and catastrophic incidents in distributed systems is
 
 ## Current Status
 
-**Current Status: Phase 3 — Telemetry Correlation & Failure Reconstruction**
+**Current Status: Phase 4 — Deterministic Failure Replay & Scenario Generation**
 
-Phase 3 builds upon the telemetry ingestion foundation to reconstruct distributed execution traces and analyze failure lifecycles:
+Phase 4 introduces the first replay-oriented capability of ChaosReplay — translating reconstructed production telemetry into deterministic, executable replay scenarios and executing them in safe simulation mode:
 
-* **Distributed Trace Correlation (`GET /api/v1/traces/{traceId}`)**: Assembles all telemetry events belonging to a distributed trace across services, sorted deterministically by occurrence timestamp ascending (`timestamp ASC, event_id ASC`). Computes trace-level aggregates: `eventCount`, `hasErrors`, `highestSeverity`, and ordered distinct `services`.
-* **Ingress Request Correlation (`GET /api/v1/requests/{requestId}`)**: Groups telemetry events by single ingress request identifier to isolate end-to-end request lifecycles.
-* **Deterministic Failure Reconstruction (`GET /api/v1/traces/{traceId}/reconstruction`)**: Reconstructs the complete execution timeline and computes exact duration metrics (`startTime`, `endTime`, `durationMs`). Automatically detects failures (`severity == ERROR || severity == FATAL || eventType == ERROR`), counts unique failure events, and isolates the precise `firstFailure` event in chronological order without speculative root-cause guessing.
-* **Consistent 404 Not Found Semantics**: Missing traces or requests return standardized `404 Not Found` error envelopes.
-* **Non-Mutating Pure Aggregation**: Telemetry entities remain immutable; correlation and reconstruction are purely query-time aggregations.
-* **Real Database Integration Testing**: Tested end-to-end against real PostgreSQL 16 via Testcontainers, verifying database-level deterministic tie-breaking and timeline reconstruction.
+* **Telemetry-Derived Replay Scenarios**: Converts historical telemetry traces into isolated, immutable replay scenario models without modifying original telemetry events.
+* **Deterministic Scenario Identity**: Scenario IDs are computed deterministically via SHA-256 over the source trace ID and ordered event sequence (`scen-<32-char-hex>`). Identical trace executions always yield identical scenario identifiers.
+* **Idempotent Scenario Generation**: Generating a scenario for an existing trace returns `200 OK` with the existing scenario, preventing duplicate records. Fresh scenarios return `201 Created`.
+* **Relative Timing Preservation**: Events preserve relative offset latencies (`offset_ms = event.timestamp - start_time`) rather than brittle wall-clock timestamps.
+* **Deterministic Sequence Ordering**: Preserves the established `timestamp ASC, event_id ASC` tie-breaker order assigned with 1-based sequential indices (`sequence_number`).
+* **Strict Simulation-Only Execution**: Replay execution processes stored event snapshots sequentially without making real external HTTP requests, invoking cloud APIs, calling databases, or sleeping on wall-clock offsets.
+* **Flyway V2 Migration**: Version-controlled `V2__create_replay_scenarios.sql` adding `replay_scenarios` and `replay_scenario_events` tables with foreign keys, unique sequence constraints, and JSONB metadata.
+* **Comprehensive Automated Tests**: 74 automated tests spanning unit tests (Mockito), MVC slice tests (`@WebMvcTest`), and real PostgreSQL 16 Testcontainers integration tests.
 
 ---
 
 ## Architecture
 
-The following diagram illustrates the Phase 3 system architecture:
+The end-to-end processing pipeline in Phase 4 is:
 
 ```mermaid
 flowchart TD
-    Client["Distributed Services / API Consumers"]
+    TelemetryProducer["Telemetry Producer / Microservices"]
     
-    subgraph SpringBootApp["ChaosReplay Spring Boot Application (port 8080)"]
+    subgraph SpringBootApp["ChaosReplay Platform (port 8080)"]
         direction TB
-        subgraph APILayer["REST API Layer"]
-            HealthAPI["Health & Actuator APIs<br/>/api/v1/health<br/>/actuator/health"]
+        subgraph IngestionLayer["Ingestion Layer"]
             TelemetryAPI["Telemetry Controller<br/>POST /api/v1/telemetry/events<br/>GET /api/v1/telemetry/events"]
+            TelemetrySvc["Telemetry Ingestion Service"]
+        end
+        
+        subgraph CorrelationLayer["Correlation & Reconstruction Layer"]
             TraceAPI["Trace Correlation Controller<br/>GET /api/v1/traces/{traceId}<br/>GET /api/v1/traces/{traceId}/reconstruction"]
-            RequestAPI["Request Correlation Controller<br/>GET /api/v1/requests/{requestId}"]
-            GlobalHandler["Global Exception Handler<br/>@RestControllerAdvice"]
+            CorrelationSvc["Trace Correlation Service"]
         end
         
-        subgraph ServiceLayer["Service Layer"]
-            TelemetrySvc["Telemetry Service<br/>Validation & Ingestion"]
-            CorrelationSvc["Trace Correlation Service<br/>Deterministic Ordering & Reconstruction"]
-            QuerySpecs["Telemetry Specification Engine<br/>Criteria API Filters"]
+        subgraph ReplayLayer["Replay & Scenario Generation Layer"]
+            ReplayAPI["Replay Scenario Controller<br/>POST /api/v1/replay/scenarios/traces/{traceId}<br/>GET /api/v1/replay/scenarios/{scenarioId}<br/>POST /api/v1/replay/scenarios/{scenarioId}/execute"]
+            ScenarioSvc["Replay Scenario Generator<br/>Idempotent & Deterministic SHA-256"]
+            SimulationEngine["Replay Simulation Engine<br/>Safe In-Memory Simulation"]
         end
         
-        subgraph PersistenceLayer["Persistence Layer"]
-            Repo["Spring Data JPA Repository<br/>TelemetryEventRepository"]
-            Flyway["Flyway Migration Engine<br/>V1__create_telemetry_events.sql"]
+        subgraph PersistenceLayer["Persistence Layer (Spring Data JPA + Flyway)"]
+            RepoTelemetry["TelemetryEventRepository"]
+            RepoScenario["ReplayScenarioRepository"]
+            RepoScenarioEvent["ReplayScenarioEventRepository"]
         end
-        
-        TraceAPI --> GlobalHandler
-        RequestAPI --> GlobalHandler
-        TelemetryAPI --> GlobalHandler
         
         TelemetryAPI --> TelemetrySvc
-        TraceAPI --> CorrelationSvc
-        RequestAPI --> CorrelationSvc
+        TelemetrySvc --> RepoTelemetry
         
-        TelemetrySvc --> QuerySpecs
-        TelemetrySvc --> Repo
-        CorrelationSvc --> Repo
+        TraceAPI --> CorrelationSvc
+        CorrelationSvc --> RepoTelemetry
+        
+        ReplayAPI --> ScenarioSvc
+        ReplayAPI --> SimulationEngine
+        ScenarioSvc --> RepoTelemetry
+        ScenarioSvc --> RepoScenario
+        ScenarioSvc --> RepoScenarioEvent
+        SimulationEngine --> RepoScenario
+        SimulationEngine --> RepoScenarioEvent
     end
     
-    subgraph Storage["Database (Docker / port 5432)"]
-        Postgres[("PostgreSQL 16<br/>JSONB & B-Tree Indexes")]
-        EventsTable[("telemetry_events<br/>Unique event_id<br/>Indexed timestamps & traces")]
+    subgraph Storage["Database (PostgreSQL 16)"]
+        TableTelemetry[("telemetry_events<br/>Immutable source of truth")]
+        TableScenarios[("replay_scenarios<br/>Deterministic scenarios")]
+        TableScenarioEvents[("replay_scenario_events<br/>Sequence & relative offsets (JSONB)")]
     end
     
-    Client -->|"POST / GET Telemetry"| TelemetryAPI
-    Client -->|"GET Trace / Reconstruction"| TraceAPI
-    Client -->|"GET Request Trace"| RequestAPI
-    Client -->|"Health Checks"| HealthAPI
-    Repo -->|"HikariCP JDBC"| Postgres
-    Flyway -.->|"DDL Migration"| Postgres
-    Postgres --> EventsTable
+    TelemetryProducer -->|"POST Telemetry"| TelemetryAPI
+    RepoTelemetry --> TableTelemetry
+    RepoScenario --> TableScenarios
+    RepoScenarioEvent --> TableScenarioEvents
 ```
 
 ---
 
-## Telemetry Domain Model
+## Replay Concepts & Design
 
-Every field in the `TelemetryEvent` model is purposefully designed to support distributed tracing and failure reconstruction:
+### 1. Why Replay Scenarios Exist
+Telemetry events are high-volume, append-only historical records. Replay scenarios are structured, deterministic execution blueprints derived from specific incident traces. They provide:
+- A self-contained execution package with all metadata and parameters preserved.
+- Normalized relative offsets (`offset_ms`) independent of original calendar dates/times.
+- Predictable sequence numbering for deterministic step-by-step playback.
 
-| Field | Type | Required | Description & Role in Reconstruction |
-| :--- | :--- | :--- | :--- |
-| `id` | `BIGSERIAL` | Auto | Internal database surrogate primary key for efficient indexing. |
-| `eventId` | `VARCHAR(64)` | Yes | Unique producer-assigned identifier with unique constraint. Serves as tie-breaker for identical timestamps. |
-| `timestamp` | `TIMESTAMPTZ` | Yes | Precise UTC event occurrence time at producer. Forms chronological sorting baseline (`timestamp ASC`). |
-| `serviceName` | `VARCHAR(100)` | Yes | Originating microservice identifier (e.g. `order-service`). Tracks involved services in order of appearance. |
-| `serviceInstance`| `VARCHAR(100)` | No | Specific node/pod/instance ID (e.g. `order-node-01`). Pinpoints failing replica. |
-| `eventType` | `VARCHAR(32)` | Yes | Controlled category: `REQUEST`, `RESPONSE`, `ERROR`, `LOG`, `DATABASE`, `EXTERNAL_CALL`. `ERROR` triggers failure condition. |
-| `severity` | `VARCHAR(20)` | Yes | Controlled level: `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`. Levels `ERROR` and `FATAL` trigger failure condition. |
-| `traceId` | `VARCHAR(64)` | No | Distributed trace identifier linking cross-service operations. Primary key for trace correlation. |
-| `requestId` | `VARCHAR(64)` | No | Ingress HTTP/RPC request identifier for operation scoping. |
-| `operation` | `VARCHAR(255)` | No | Operation name or HTTP endpoint (e.g. `POST /payments`, `SELECT users`). |
-| `message` | `TEXT` | No | Human-readable log or diagnostic message. |
-| `metadata` | `JSONB` | No | Arbitrary contextual key-value payload (e.g. latencies, parameters, headers) stored as native JSONB. |
-| `createdAt` | `TIMESTAMPTZ` | Auto | Database record insertion timestamp in UTC (system audit trail). |
+### 2. Immutability & Separation of Concerns
+`TelemetryEvent` records are strictly immutable. Scenario generation creates independent `ReplayScenario` and `ReplayScenarioEvent` records, guaranteeing that simulation replays never alter telemetry audit trails.
+
+### 3. Deterministic Scenario Identification
+Scenario IDs are generated via SHA-256 over the source trace ID and ordered event timestamps/IDs:
+$$\text{scenarioId} = \text{"scen-"} + \text{hex}(\text{SHA-256}(\text{traceId} : \text{eventId}_1@t_1, \dots))[0..32]$$
+This guarantees that identical telemetry sequences always produce the exact same scenario ID, enabling idempotent creation and cache-safe retrieval.
+
+### 4. Safety Guarantees
+Step 4 replay is **strictly simulation-only**:
+- **No Network Calls**: Replay never sends HTTP requests, gRPC calls, or socket connections to external systems.
+- **No Command Execution**: Metadata payloads are treated purely as passive data; no scripting or dynamic expression evaluation is permitted.
+- **No Wall-Clock Blocking**: Replay processes relative offsets sequentially without invoking `Thread.sleep()`.
+- **No Database Corruption**: Replay only updates scenario execution status (`CREATED -> RUNNING -> COMPLETED`).
+
+---
+
+## Database Schema (Flyway V1 & V2)
+
+### `replay_scenarios`
+```sql
+CREATE TABLE replay_scenarios (
+    id BIGSERIAL PRIMARY KEY,
+    scenario_id VARCHAR(64) NOT NULL UNIQUE,
+    source_trace_id VARCHAR(64) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    event_count INT NOT NULL,
+    failure_count INT NOT NULL,
+    duration_ms BIGINT NOT NULL,
+    status VARCHAR(32) NOT NULL
+);
+
+CREATE INDEX idx_replay_scenarios_source_trace_id ON replay_scenarios (source_trace_id);
+```
+
+### `replay_scenario_events`
+```sql
+CREATE TABLE replay_scenario_events (
+    id BIGSERIAL PRIMARY KEY,
+    scenario_id VARCHAR(64) NOT NULL REFERENCES replay_scenarios (scenario_id) ON DELETE CASCADE,
+    event_id VARCHAR(64) NOT NULL,
+    offset_ms BIGINT NOT NULL,
+    sequence_number INT NOT NULL,
+    service_name VARCHAR(100) NOT NULL,
+    service_instance VARCHAR(100),
+    event_type VARCHAR(32) NOT NULL,
+    severity VARCHAR(20) NOT NULL,
+    trace_id VARCHAR(64),
+    request_id VARCHAR(64),
+    operation VARCHAR(255),
+    message TEXT,
+    metadata JSONB,
+
+    CONSTRAINT uq_replay_scenario_events_scenario_seq UNIQUE (scenario_id, sequence_number)
+);
+
+CREATE INDEX idx_replay_scenario_events_scenario_seq ON replay_scenario_events (scenario_id, sequence_number);
+```
 
 ---
 
 ## API Reference
 
-### 1. Ingest Telemetry Event
+### 1. Generate Replay Scenario
 
-Ingests a single telemetry event into the system.
+Generates a deterministic replay scenario from a reconstructed trace. Idempotent: returns `201 Created` on first generation, `200 OK` on subsequent requests.
 
-* **Endpoint**: `POST /api/v1/telemetry/events`
-* **Content-Type**: `application/json`
-* **Response Code**: `201 Created`
-
-**Request Example**:
-
-```bash
-curl -X POST http://localhost:8080/api/v1/telemetry/events \
-  -H "Content-Type: application/json" \
-  -d '{
-    "eventId": "evt-001",
-    "timestamp": "2026-09-21T15:30:00Z",
-    "serviceName": "payment-service",
-    "serviceInstance": "payment-01",
-    "eventType": "ERROR",
-    "severity": "ERROR",
-    "traceId": "trace-123",
-    "requestId": "req-456",
-    "operation": "POST /payments",
-    "message": "Payment provider timeout",
-    "metadata": {
-      "provider": "stripe",
-      "timeoutMs": 5000
-    }
-  }'
-```
-
-**Success Response (`201 Created`)**:
-
-```json
-{
-  "id": 1,
-  "eventId": "evt-001",
-  "timestamp": "2026-09-21T15:30:00Z",
-  "serviceName": "payment-service",
-  "serviceInstance": "payment-01",
-  "eventType": "ERROR",
-  "severity": "ERROR",
-  "traceId": "trace-123",
-  "requestId": "req-456",
-  "operation": "POST /payments",
-  "message": "Payment provider timeout",
-  "metadata": {
-    "provider": "stripe",
-    "timeoutMs": 5000
-  },
-  "createdAt": "2026-09-21T15:30:01.123456Z"
-}
-```
-
----
-
-### 2. Query Telemetry Events
-
-Queries telemetry events with multi-criteria filtering and bounded pagination. Results are sorted by `timestamp DESC`.
-
-* **Endpoint**: `GET /api/v1/telemetry/events`
-* **Query Parameters**: `serviceName`, `eventType`, `severity`, `traceId`, `requestId`, `from`, `to`, `page`, `size`
-* **Response Code**: `200 OK`
-
----
-
-### 3. Correlate Trace Events
-
-Retrieves all telemetry events belonging to a distributed trace, ordered chronologically (`timestamp ASC, event_id ASC`).
-
-* **Endpoint**: `GET /api/v1/traces/{traceId}`
-* **Response Code**: `200 OK` (or `404 Not Found`)
+* **Endpoint**: `POST /api/v1/replay/scenarios/traces/{traceId}`
+* **Response Codes**: `201 Created`, `200 OK` (idempotent), `404 Not Found` (trace missing)
 
 **Example Request**:
-
 ```bash
-curl http://localhost:8080/api/v1/traces/trace-123
+curl -X POST http://localhost:8080/api/v1/replay/scenarios/traces/trace-123
 ```
 
-**Response (`200 OK`)**:
-
+**Response (`201 Created` / `200 OK`)**:
 ```json
 {
-  "traceId": "trace-123",
+  "scenarioId": "scen-d7da823e1f70b71ed6008dff2edc30cd",
+  "sourceTraceId": "trace-123",
+  "createdAt": "2026-09-23T14:59:47.379316Z",
   "eventCount": 3,
-  "hasErrors": true,
-  "highestSeverity": "ERROR",
-  "services": [
-    "api-gateway",
-    "order-service",
-    "payment-service"
-  ],
+  "failureCount": 1,
+  "durationMs": 2000,
+  "status": "CREATED",
   "events": [
     {
-      "id": 1,
+      "sequenceNumber": 1,
       "eventId": "evt-001",
-      "timestamp": "2026-09-21T15:30:00Z",
+      "offsetMs": 0,
       "serviceName": "api-gateway",
       "serviceInstance": "gw-01",
       "eventType": "REQUEST",
@@ -223,13 +205,12 @@ curl http://localhost:8080/api/v1/traces/trace-123
       "requestId": "req-456",
       "operation": "POST /checkout",
       "message": "Incoming checkout request",
-      "metadata": null,
-      "createdAt": "2026-09-21T15:30:00.123456Z"
+      "metadata": null
     },
     {
-      "id": 2,
+      "sequenceNumber": 2,
       "eventId": "evt-002",
-      "timestamp": "2026-09-21T15:30:01Z",
+      "offsetMs": 1000,
       "serviceName": "order-service",
       "serviceInstance": "ord-01",
       "eventType": "REQUEST",
@@ -238,13 +219,12 @@ curl http://localhost:8080/api/v1/traces/trace-123
       "requestId": "req-456",
       "operation": "POST /orders",
       "message": "Validating order",
-      "metadata": null,
-      "createdAt": "2026-09-21T15:30:01.123456Z"
+      "metadata": null
     },
     {
-      "id": 3,
+      "sequenceNumber": 3,
       "eventId": "evt-003",
-      "timestamp": "2026-09-21T15:30:02Z",
+      "offsetMs": 2000,
       "serviceName": "payment-service",
       "serviceInstance": "pay-01",
       "eventType": "EXTERNAL_CALL",
@@ -253,8 +233,10 @@ curl http://localhost:8080/api/v1/traces/trace-123
       "requestId": "req-456",
       "operation": "POST /charge",
       "message": "Payment provider timeout",
-      "metadata": { "provider": "stripe", "timeoutMs": 5000 },
-      "createdAt": "2026-09-21T15:30:02.123456Z"
+      "metadata": {
+        "provider": "stripe",
+        "timeoutMs": 5000
+      }
     }
   ]
 }
@@ -262,198 +244,100 @@ curl http://localhost:8080/api/v1/traces/trace-123
 
 ---
 
-### 4. Correlate Request Events
+### 2. Retrieve Replay Scenario
 
-Retrieves all telemetry events scoped to a specific ingress request, ordered chronologically.
+Retrieves an existing replay scenario and its ordered event snapshots.
 
-* **Endpoint**: `GET /api/v1/requests/{requestId}`
-* **Response Code**: `200 OK` (or `404 Not Found`)
+* **Endpoint**: `GET /api/v1/replay/scenarios/{scenarioId}`
+* **Response Codes**: `200 OK`, `404 Not Found`
 
 **Example Request**:
-
 ```bash
-curl http://localhost:8080/api/v1/requests/req-456
+curl http://localhost:8080/api/v1/replay/scenarios/scen-d7da823e1f70b71ed6008dff2edc30cd
 ```
 
 ---
 
-### 5. Reconstruct Trace Execution Timeline
+### 3. Execute Replay Simulation
 
-Reconstructs the execution timeline, duration metrics, and deterministic failure diagnostics for a trace.
+Executes the replay scenario in deterministic simulation mode.
 
-* **Endpoint**: `GET /api/v1/traces/{traceId}/reconstruction`
-* **Response Code**: `200 OK` (or `404 Not Found`)
+* **Endpoint**: `POST /api/v1/replay/scenarios/{scenarioId}/execute`
+* **Response Codes**: `200 OK`, `404 Not Found`, `409 Conflict` (if scenario is already `RUNNING`)
 
 **Example Request**:
-
 ```bash
-curl http://localhost:8080/api/v1/traces/trace-123/reconstruction
+curl -X POST http://localhost:8080/api/v1/replay/scenarios/scen-d7da823e1f70b71ed6008dff2edc30cd/execute
 ```
 
 **Response (`200 OK`)**:
-
 ```json
 {
-  "traceId": "trace-123",
-  "eventCount": 3,
-  "services": [
-    "api-gateway",
-    "order-service",
-    "payment-service"
-  ],
-  "startTime": "2026-09-21T15:30:00Z",
-  "endTime": "2026-09-21T15:30:02Z",
-  "durationMs": 2000,
-  "hasFailure": true,
-  "failureCount": 1,
-  "firstFailure": {
-    "eventId": "evt-003",
-    "serviceName": "payment-service",
-    "serviceInstance": "pay-01",
-    "timestamp": "2026-09-21T15:30:02Z",
-    "eventType": "EXTERNAL_CALL",
-    "severity": "ERROR",
-    "operation": "POST /charge",
-    "message": "Payment provider timeout"
-  },
-  "timeline": [
-    {
-      "id": 1,
-      "eventId": "evt-001",
-      "timestamp": "2026-09-21T15:30:00Z",
-      "serviceName": "api-gateway",
-      "serviceInstance": "gw-01",
-      "eventType": "REQUEST",
-      "severity": "INFO",
-      "traceId": "trace-123",
-      "requestId": "req-456",
-      "operation": "POST /checkout",
-      "message": "Incoming checkout request",
-      "metadata": null,
-      "createdAt": "2026-09-21T15:30:00.123456Z"
-    },
-    {
-      "id": 2,
-      "eventId": "evt-002",
-      "timestamp": "2026-09-21T15:30:01Z",
-      "serviceName": "order-service",
-      "serviceInstance": "ord-01",
-      "eventType": "REQUEST",
-      "severity": "INFO",
-      "traceId": "trace-123",
-      "requestId": "req-456",
-      "operation": "POST /orders",
-      "message": "Validating order",
-      "metadata": null,
-      "createdAt": "2026-09-21T15:30:01.123456Z"
-    },
-    {
-      "id": 3,
-      "eventId": "evt-003",
-      "timestamp": "2026-09-21T15:30:02Z",
-      "serviceName": "payment-service",
-      "serviceInstance": "pay-01",
-      "eventType": "EXTERNAL_CALL",
-      "severity": "ERROR",
-      "traceId": "trace-123",
-      "requestId": "req-456",
-      "operation": "POST /charge",
-      "message": "Payment provider timeout",
-      "metadata": { "provider": "stripe", "timeoutMs": 5000 },
-      "createdAt": "2026-09-21T15:30:02.123456Z"
-    }
-  ]
-}
-```
-
-**Unknown Trace Error Response (`404 Not Found`)**:
-
-```json
-{
-  "timestamp": "2026-09-21T15:35:00.000000Z",
-  "status": 404,
-  "error": "NOT_FOUND",
-  "message": "Trace not found: unknown-trace-id",
-  "path": "/api/v1/traces/unknown-trace-id"
+  "scenarioId": "scen-d7da823e1f70b71ed6008dff2edc30cd",
+  "status": "COMPLETED",
+  "startedAt": "2026-09-23T15:02:12.093179Z",
+  "completedAt": "2026-09-23T15:02:12.100632Z",
+  "durationMs": 7,
+  "eventsProcessed": 3,
+  "failuresSimulated": 1,
+  "message": "Deterministic simulation replay completed successfully"
 }
 ```
 
 ---
 
-### 6. Service Health Endpoints
+### 4. Retrieve Scenarios for Trace
 
-* `GET /api/v1/health`: Basic service operational heartbeat.
-* `GET /actuator/health`: Production health probe reporting database connectivity, connection pool status, and disk space.
+Retrieves all scenarios generated from a specific source trace ID.
 
----
-
-## Technology Stack
-
-The technologies implemented in Phases 1, 2 & 3 are:
-
-* **Language**: Java 21 (LTS)
-* **Framework**: Spring Boot 3.4.2
-* **Web Layer**: Spring Web (Spring MVC)
-* **Operational Monitoring**: Spring Boot Actuator
-* **Database & ORM**: PostgreSQL 16, Spring Data JPA, Hibernate 6 (`JSONB` mapping via `@JdbcTypeCode`)
-* **Database Migrations**: Flyway 10
-* **Connection Pooling**: HikariCP
-* **Validation**: Jakarta Bean Validation (Hibernate Validator)
-* **Build Tool**: Apache Maven (via Maven Wrapper `mvnw`)
-* **Testing**: JUnit 5, Spring Boot Test, Mockito, MockMvc, AssertJ, Testcontainers PostgreSQL
-* **Containerization**: Docker (multi-stage build), Docker Compose
+* **Endpoint**: `GET /api/v1/replay/scenarios/traces/{traceId}`
+* **Response Codes**: `200 OK`
 
 ---
 
-## Local Setup & Execution
+### 5. Telemetry & Correlation Endpoints (from Phases 1–3)
 
-### Prerequisites
-
-* Java 21 JDK installed
-* Docker and Docker Compose installed
-
-### 1. Start PostgreSQL Container
-
-```bash
-docker compose up -d
-docker compose ps
-```
-
-### 2. Run the Application
-
-```bash
-./mvnw spring-boot:run
-```
-
-The application starts on port `8080`, automatically executes Flyway migrations against PostgreSQL, and initializes HikariCP.
+* `POST /api/v1/telemetry/events`: Ingests telemetry event (`201 Created`, `409 Conflict`).
+* `GET /api/v1/telemetry/events`: Multi-criteria querying with pagination.
+* `GET /api/v1/traces/{traceId}`: Correlates trace events chronologically (`200 OK`, `404 Not Found`).
+* `GET /api/v1/requests/{requestId}`: Correlates ingress request events (`200 OK`, `404 Not Found`).
+* `GET /api/v1/traces/{traceId}/reconstruction`: Reconstructs trace duration, failure metrics, and first failure (`200 OK`, `404 Not Found`).
+* `GET /api/v1/health`: Heartbeat health check.
+* `GET /actuator/health`: Production health probe reporting database connectivity.
 
 ---
 
 ## Automated Testing Suite
 
-Run the full automated test suite (48 tests including Testcontainers PostgreSQL integration tests):
+Run the full automated test suite (74 tests including Testcontainers PostgreSQL integration tests):
 
 ```bash
 ./mvnw clean test
 ```
 
 ### Test Hierarchy:
-1. **Unit Tests (`TelemetryServiceTest`, `TraceCorrelationServiceTest`)**: Fast business logic tests verifying duplicate detection, concurrency constraint propagation, query parameter validation, trace/request correlation, duration calculation, and deterministic first-failure extraction with Mockito.
-2. **Web Slice Tests (`TelemetryControllerTest`, `TraceCorrelationControllerTest`, `RequestCorrelationControllerTest`, `HealthControllerTest`, `ValidationTest`)**: Controller slice tests verifying HTTP contracts, JSON serialization/deserialization, 404 error envelopes, bean validation, and parameter binding via MockMvc.
-3. **PostgreSQL Integration Tests (`TelemetryPostgresIntegrationTest`, `CorrelationPostgresIntegrationTest`)**: Real end-to-end database tests against PostgreSQL 16 via Testcontainers, verifying Flyway migration execution, `JSONB` column mapping, unique index enforcement, database-level sorting (`ORDER BY timestamp ASC, event_id ASC`), and multi-service timeline reconstruction.
+1. **Unit Tests**:
+   - `ReplayScenarioServiceTest`: Verifies deterministic SHA-256 scenario ID generation, relative `offset_ms` computation, single-counted failure analysis, tie-breaking order preservation, and idempotency.
+   - `ReplayExecutionServiceTest`: Verifies safe simulation execution, status lifecycle transitions (`CREATED -> RUNNING -> COMPLETED`), failure counting, and conflict prevention on concurrent runs.
+   - `TraceCorrelationServiceTest`: Verifies trace/request correlation and failure timeline reconstruction.
+   - `TelemetryServiceTest`: Verifies duplicate rejection, concurrency constraints, and query filtering.
+2. **Web Slice Tests (`@WebMvcTest`)**:
+   - `ReplayScenarioControllerTest`: Verifies HTTP 201/200 idempotency, 404 handling, and 409 conflict responses.
+   - `TraceCorrelationControllerTest`, `RequestCorrelationControllerTest`, `TelemetryControllerTest`, `HealthControllerTest`, `ValidationTest`.
+3. **Real PostgreSQL Integration Tests (`@Testcontainers`)**:
+   - `ReplayPostgresIntegrationTest`: Verifies Flyway V2 migrations, foreign keys, JSONB metadata persistence, sequence uniqueness constraints, and simulation lifecycle updates against live PostgreSQL 16.
+   - `CorrelationPostgresIntegrationTest`, `TelemetryPostgresIntegrationTest`.
 
 ---
 
 ## Packaging & Docker
 
 ### Package JAR:
-
 ```bash
 ./mvnw clean package
 ```
 
 ### Build Production Docker Image:
-
 ```bash
 docker build -t chaosreplay:latest .
 ```
@@ -465,11 +349,12 @@ docker build -t chaosreplay:latest .
 * **Phase 1 — Foundation** *(Completed)*
 * **Phase 2 — Telemetry Ingestion** *(Completed)*
 * **Phase 3 — Telemetry Correlation & Failure Reconstruction** *(Completed)*
-* **Phase 4 — Service Dependency Graph** *(Upcoming)*
-* **Phase 5 — Minimal Reproduction Engine** *(Upcoming)*
-* **Phase 6 — Isolated Replay Engine** *(Upcoming)*
-* **Phase 7 — Chaos Injection** *(Upcoming)*
-* **Phase 8 — Candidate Fix Verification** *(Upcoming)*
-* **Phase 9 — Observability (OTel/Prometheus/Grafana)** *(Upcoming)*
-* **Phase 10 — Angular Incident Dashboard** *(Upcoming)*
-* **Phase 11 — Kubernetes/AWS Deployment** *(Upcoming)*
+* **Phase 4 — Deterministic Failure Replay & Scenario Generation** *(Completed)*
+* **Phase 5 — Service Dependency Graph** *(Upcoming)*
+* **Phase 6 — Minimal Reproduction Engine** *(Upcoming)*
+* **Phase 7 — Isolated Replay Engine** *(Upcoming)*
+* **Phase 8 — Chaos Injection** *(Upcoming)*
+* **Phase 9 — Candidate Fix Verification** *(Upcoming)*
+* **Phase 10 — Observability (OTel/Prometheus/Grafana)** *(Upcoming)*
+* **Phase 11 — Angular Incident Dashboard** *(Upcoming)*
+* **Phase 12 — Kubernetes/AWS Deployment** *(Upcoming)*

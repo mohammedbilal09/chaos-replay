@@ -1,5 +1,7 @@
 package com.chaosreplay;
 
+import com.chaosreplay.repository.ReplayScenarioEventRepository;
+import com.chaosreplay.repository.ReplayScenarioRepository;
 import com.chaosreplay.repository.TelemetryEventRepository;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -13,6 +15,12 @@ class ChaosReplayApplicationTests {
 
     @MockitoBean
     private TelemetryEventRepository telemetryEventRepository;
+
+    @MockitoBean
+    private ReplayScenarioRepository replayScenarioRepository;
+
+    @MockitoBean
+    private ReplayScenarioEventRepository replayScenarioEventRepository;
 
     @Test
     @DisplayName("Application context starts successfully without external dependencies")
