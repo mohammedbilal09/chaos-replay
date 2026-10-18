@@ -8,6 +8,8 @@ import com.chaosreplay.domain.Severity;
 import com.chaosreplay.service.TelemetryQueryFilter;
 import com.chaosreplay.service.TelemetryService;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
@@ -15,6 +17,7 @@ import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -29,6 +32,7 @@ import java.time.Instant;
  */
 @RestController
 @RequestMapping("/api/v1/telemetry/events")
+@Validated
 public class TelemetryController {
 
     private final TelemetryService telemetryService;
@@ -68,11 +72,11 @@ public class TelemetryController {
      */
     @GetMapping(produces = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<PagedResponse<TelemetryEventResponse>> queryEvents(
-            @RequestParam(required = false) String serviceName,
+            @RequestParam(required = false) @Size(max = 100) String serviceName,
             @RequestParam(required = false) EventType eventType,
             @RequestParam(required = false) Severity severity,
-            @RequestParam(required = false) String traceId,
-            @RequestParam(required = false) String requestId,
+            @RequestParam(required = false) @Size(max = 64) @Pattern(regexp = "^[a-zA-Z0-9-_.:]+$") String traceId,
+            @RequestParam(required = false) @Size(max = 64) @Pattern(regexp = "^[a-zA-Z0-9-_.:]+$") String requestId,
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant from,
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant to,
             @RequestParam(defaultValue = "0") int page,
@@ -100,4 +104,3 @@ public class TelemetryController {
         return ResponseEntity.ok(response);
     }
 }
-

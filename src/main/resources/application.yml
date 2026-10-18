@@ -5,6 +5,9 @@ spring:
     default: local
   jpa:
     open-in-view: false
+  servlet:
+    multipart:
+      enabled: false
   kafka:
     bootstrap-servers: ${chaosreplay.kafka.bootstrap-servers}
     consumer:
@@ -23,6 +26,11 @@ chaosreplay:
     retry:
       max-attempts: ${CHAOSREPLAY_KAFKA_RETRY_MAX_ATTEMPTS:3}
       backoff-ms: ${CHAOSREPLAY_KAFKA_RETRY_BACKOFF_MS:1000}
+  security:
+    cors:
+      enabled: ${CHAOSREPLAY_CORS_ENABLED:false}
+      allowed-origins: ${CHAOSREPLAY_CORS_ALLOWED_ORIGINS:}
+      max-age: 3600
 
 management:
   endpoints:
@@ -36,6 +44,18 @@ management:
       show-details: never
       probes:
         enabled: true
+    env:
+      enabled: false
+    beans:
+      enabled: false
+    mappings:
+      enabled: false
+    configprops:
+      enabled: false
+    heapdump:
+      enabled: false
+    threaddump:
+      enabled: false
   health:
     kafka:
       enabled: ${chaosreplay.kafka.enabled:true}
@@ -46,4 +66,7 @@ management:
 server:
   port: 8080
   shutdown: graceful
-
+  max-http-request-header-size: 8KB
+  tomcat:
+    max-http-form-post-size: 1MB
+    max-swallow-size: 2MB

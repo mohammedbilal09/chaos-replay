@@ -4,9 +4,13 @@ import com.chaosreplay.api.dto.ReplayExecutionResponse;
 import com.chaosreplay.api.dto.ReplayScenarioResponse;
 import com.chaosreplay.service.ReplayExecutionService;
 import com.chaosreplay.service.ReplayScenarioService;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -20,6 +24,7 @@ import java.util.List;
  */
 @RestController
 @RequestMapping("/api/v1/replay/scenarios")
+@Validated
 public class ReplayScenarioController {
 
     private final ReplayScenarioService scenarioService;
@@ -41,7 +46,9 @@ public class ReplayScenarioController {
      * @return 201 CREATED or 200 OK with the generated scenario payload
      */
     @PostMapping(value = "/traces/{traceId}", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<ReplayScenarioResponse> createScenario(@PathVariable String traceId) {
+    public ResponseEntity<ReplayScenarioResponse> createScenario(
+            @PathVariable @NotBlank @Size(max = 64) @Pattern(regexp = "^[a-zA-Z0-9-_.:]+$") String traceId
+    ) {
         ReplayScenarioService.ReplayScenarioCreationResult result = scenarioService.createScenario(traceId);
         if (result.newlyCreated()) {
             return ResponseEntity.status(HttpStatus.CREATED).body(result.scenario());
@@ -57,7 +64,9 @@ public class ReplayScenarioController {
      * @return 200 OK with the replay scenario, or 404 NOT FOUND
      */
     @GetMapping(value = "/{scenarioId}", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<ReplayScenarioResponse> getScenario(@PathVariable String scenarioId) {
+    public ResponseEntity<ReplayScenarioResponse> getScenario(
+            @PathVariable @NotBlank @Size(max = 64) @Pattern(regexp = "^[a-zA-Z0-9-_.:]+$") String scenarioId
+    ) {
         ReplayScenarioResponse response = scenarioService.getScenario(scenarioId);
         return ResponseEntity.ok(response);
     }
@@ -69,7 +78,9 @@ public class ReplayScenarioController {
      * @return 200 OK with simulation execution metrics, 404 NOT FOUND, or 409 CONFLICT if already running
      */
     @PostMapping(value = "/{scenarioId}/execute", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<ReplayExecutionResponse> executeScenario(@PathVariable String scenarioId) {
+    public ResponseEntity<ReplayExecutionResponse> executeScenario(
+            @PathVariable @NotBlank @Size(max = 64) @Pattern(regexp = "^[a-zA-Z0-9-_.:]+$") String scenarioId
+    ) {
         ReplayExecutionResponse response = executionService.executeScenario(scenarioId);
         return ResponseEntity.ok(response);
     }
@@ -81,9 +92,10 @@ public class ReplayScenarioController {
      * @return 200 OK with the list of replay scenarios
      */
     @GetMapping(value = "/traces/{traceId}", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<List<ReplayScenarioResponse>> getScenariosForTrace(@PathVariable String traceId) {
+    public ResponseEntity<List<ReplayScenarioResponse>> getScenariosForTrace(
+            @PathVariable @NotBlank @Size(max = 64) @Pattern(regexp = "^[a-zA-Z0-9-_.:]+$") String traceId
+    ) {
         List<ReplayScenarioResponse> responses = scenarioService.getScenariosForTrace(traceId);
         return ResponseEntity.ok(responses);
     }
 }
-

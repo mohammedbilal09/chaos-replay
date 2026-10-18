@@ -3,8 +3,12 @@ package com.chaosreplay.api;
 import com.chaosreplay.api.dto.TraceCorrelationResponse;
 import com.chaosreplay.api.dto.TraceReconstructionResponse;
 import com.chaosreplay.service.TraceCorrelationService;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -15,6 +19,7 @@ import org.springframework.web.bind.annotation.RestController;
  */
 @RestController
 @RequestMapping("/api/v1/traces")
+@Validated
 public class TraceCorrelationController {
 
     private final TraceCorrelationService correlationService;
@@ -30,7 +35,9 @@ public class TraceCorrelationController {
      * @return 200 OK with correlated trace payload, or 404 NOT FOUND if trace does not exist
      */
     @GetMapping(value = "/{traceId}", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<TraceCorrelationResponse> getTrace(@PathVariable String traceId) {
+    public ResponseEntity<TraceCorrelationResponse> getTrace(
+            @PathVariable @NotBlank @Size(max = 64) @Pattern(regexp = "^[a-zA-Z0-9-_.:]+$") String traceId
+    ) {
         TraceCorrelationResponse response = correlationService.getTraceCorrelation(traceId);
         return ResponseEntity.ok(response);
     }
@@ -42,9 +49,10 @@ public class TraceCorrelationController {
      * @return 200 OK with reconstructed execution timeline, or 404 NOT FOUND if trace does not exist
      */
     @GetMapping(value = "/{traceId}/reconstruction", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<TraceReconstructionResponse> reconstructTrace(@PathVariable String traceId) {
+    public ResponseEntity<TraceReconstructionResponse> reconstructTrace(
+            @PathVariable @NotBlank @Size(max = 64) @Pattern(regexp = "^[a-zA-Z0-9-_.:]+$") String traceId
+    ) {
         TraceReconstructionResponse response = correlationService.reconstructTrace(traceId);
         return ResponseEntity.ok(response);
     }
 }
-

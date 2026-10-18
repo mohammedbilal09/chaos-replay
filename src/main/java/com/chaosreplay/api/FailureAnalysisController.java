@@ -2,9 +2,13 @@ package com.chaosreplay.api;
 
 import com.chaosreplay.api.dto.FailureAnalysisResponse;
 import com.chaosreplay.service.FailureAnalysisService;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Size;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -18,6 +22,7 @@ import java.util.List;
  */
 @RestController
 @RequestMapping("/api/v1/analysis")
+@Validated
 public class FailureAnalysisController {
 
     private final FailureAnalysisService analysisService;
@@ -34,7 +39,9 @@ public class FailureAnalysisController {
      * @return 201 CREATED or 200 OK with the analysis response payload
      */
     @PostMapping(value = "/traces/{traceId}", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<FailureAnalysisResponse> analyzeTrace(@PathVariable String traceId) {
+    public ResponseEntity<FailureAnalysisResponse> analyzeTrace(
+            @PathVariable @NotBlank @Size(max = 64) @Pattern(regexp = "^[a-zA-Z0-9-_.:]+$") String traceId
+    ) {
         FailureAnalysisService.AnalysisResult result = analysisService.analyzeTrace(traceId);
         if (result.newlyCreated()) {
             return ResponseEntity.status(HttpStatus.CREATED).body(result.response());
@@ -50,7 +57,9 @@ public class FailureAnalysisController {
      * @return 200 OK with analysis details, candidates, and evidence, or 404 NOT FOUND
      */
     @GetMapping(value = "/{analysisId}", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<FailureAnalysisResponse> getAnalysis(@PathVariable String analysisId) {
+    public ResponseEntity<FailureAnalysisResponse> getAnalysis(
+            @PathVariable @NotBlank @Size(max = 64) @Pattern(regexp = "^[a-zA-Z0-9-_.:]+$") String analysisId
+    ) {
         FailureAnalysisResponse response = analysisService.getAnalysis(analysisId);
         return ResponseEntity.ok(response);
     }
@@ -62,7 +71,9 @@ public class FailureAnalysisController {
      * @return 200 OK with latest analysis, or 404 NOT FOUND
      */
     @GetMapping(value = "/traces/{traceId}", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<FailureAnalysisResponse> getLatestAnalysisForTrace(@PathVariable String traceId) {
+    public ResponseEntity<FailureAnalysisResponse> getLatestAnalysisForTrace(
+            @PathVariable @NotBlank @Size(max = 64) @Pattern(regexp = "^[a-zA-Z0-9-_.:]+$") String traceId
+    ) {
         FailureAnalysisResponse response = analysisService.getLatestAnalysisForTrace(traceId);
         return ResponseEntity.ok(response);
     }
@@ -74,9 +85,10 @@ public class FailureAnalysisController {
      * @return 200 OK with list of analysis records, or 404 NOT FOUND
      */
     @GetMapping(value = "/traces/{traceId}/history", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<List<FailureAnalysisResponse>> getAnalysisHistoryForTrace(@PathVariable String traceId) {
+    public ResponseEntity<List<FailureAnalysisResponse>> getAnalysisHistoryForTrace(
+            @PathVariable @NotBlank @Size(max = 64) @Pattern(regexp = "^[a-zA-Z0-9-_.:]+$") String traceId
+    ) {
         List<FailureAnalysisResponse> responses = analysisService.getAnalysisHistoryForTrace(traceId);
         return ResponseEntity.ok(responses);
     }
 }
-

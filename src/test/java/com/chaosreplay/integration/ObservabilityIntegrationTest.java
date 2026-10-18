@@ -176,4 +176,20 @@ class ObservabilityIntegrationTest {
                 .andExpect(jsonPath("$.measurements[0].statistic").value("COUNT"))
                 .andExpect(jsonPath("$.measurements[0].value").value(1.0));
     }
+
+    @Test
+    @DisplayName("Sensitive Actuator endpoints are disabled and return 404")
+    void verifyActuatorSensitiveEndpointsAreDisabled() throws Exception {
+        mockMvc.perform(get("/actuator/env").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
+
+        mockMvc.perform(get("/actuator/beans").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
+
+        mockMvc.perform(get("/actuator/mappings").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
+
+        mockMvc.perform(get("/actuator/heapdump").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isNotFound());
+    }
 }

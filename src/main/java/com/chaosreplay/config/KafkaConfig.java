@@ -87,7 +87,10 @@ public class KafkaConfig {
         errorHandler.addNotRetryableExceptions(
                 InvalidTelemetryMessageException.class,
                 IllegalArgumentException.class,
-                MethodArgumentNotValidException.class
+                MethodArgumentNotValidException.class,
+                jakarta.validation.ValidationException.class,
+                com.fasterxml.jackson.core.JsonProcessingException.class,
+                org.springframework.messaging.converter.MessageConversionException.class
         );
 
         return errorHandler;

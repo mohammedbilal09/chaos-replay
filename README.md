@@ -844,6 +844,115 @@ During Phase 9, an architectural evaluation was performed on whether to introduc
 
 ---
 
+## API Security & Reliability Hardening (Phase 10)
+
+Phase 10 hardens ChaosReplay's ingestion APIs, error handling, transport headers, and Kafka consumers against malformed payloads, injection attempts, unbounded memory consumption, and internal stack trace leakage.
+
+### 1. Request Validation & Input Boundaries
+
+All public write endpoints enforce strict Jakarta Bean Validation and controller-level parameter boundaries:
+
+* **Telemetry Payload Boundaries**:
+  * `eventId`: `@NotBlank`, `@Size(max = 64)`, `@Pattern(regexp = "^$|^[a-zA-Z0-9-_.:]+$")` (alphanumeric, dash, underscore, dot, colon).
+  * `traceId` / `requestId`: Optional, but when present bounded to `@Size(max = 64)` and `@Pattern(regexp = "^$|^[a-zA-Z0-9-_.:]+$")`.
+  * `serviceName` / `serviceInstance`: `@Size(max = 100)`.
+  * `operation`: `@Size(max = 255)`.
+  * `message`: Bounded to `@Size(max = 4000)`.
+  * `metadata`: Bounded to `@Size(max = 50)` entries, with keys verified to be non-blank and at most 64 characters.
+* **Controller Path Variables**:
+  * Annotated with `@Validated` across all controllers (`ReplayScenarioController`, `ReplayVerificationController`, `FailureAnalysisController`, `IncidentController`, `TraceCorrelationController`, `RequestCorrelationController`).
+  * Enforces `@NotBlank`, `@Size(max = 64)`, and `@Pattern(regexp = "^[a-zA-Z0-9-_.:]+$")` on trace IDs, scenario IDs, verification IDs, and analysis IDs to prevent path traversal or unbounded buffer injection.
+* **Pagination Boundaries**:
+  * `page >= 0`, `size` constrained between 1 and 100 on `GET /api/v1/telemetry/events`.
+
+### 2. Standardized & Safe Error Responses
+
+All unhandled exceptions and validation failures are intercepted by `GlobalExceptionHandler` and translated into a standardized, secure `ApiErrorResponse` payload:
+
+```json
+{
+  "timestamp": "2026-10-18T12:00:00Z",
+  "status": 400,
+  "error": "BAD_REQUEST",
+  "message": "Validation failed: eventId: eventId contains invalid characters",
+  "path": "/api/v1/telemetry/events",
+  "errorCode": "VALIDATION_FAILED",
+  "details": [
+    {
+      "field": "eventId",
+      "message": "eventId contains invalid characters",
+      "rejectedValue": "evt;DROP TABLE"
+    }
+  ],
+  "correlationId": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+* **No Internal Detail Leaks**:
+  * Deserialization errors (`HttpMessageNotReadableException`) sanitize all internal Java package names (such as `com.chaosreplay...`) and class hierarchies before returning messages to clients.
+  * Internal server errors (`Exception.class`) return a generic safe message (`"An unexpected internal error occurred"`) while logging the full exception stack trace internally alongside the request's correlation ID.
+* **Precise HTTP Status Codes**:
+  * `400 BAD_REQUEST`: Validation errors, type mismatches, missing parameters, unreadable JSON (`VALIDATION_FAILED`, `MALFORMED_REQUEST`, `TYPE_MISMATCH`).
+  * `404 NOT_FOUND`: Resource lookups for unknown trace/scenario/verification IDs (`RESOURCE_NOT_FOUND`).
+  * `405 METHOD_NOT_ALLOWED`: HTTP method mismatches (`METHOD_NOT_ALLOWED`).
+  * `406 NOT_ACCEPTABLE`: Unacceptable requested media types (`NOT_ACCEPTABLE`).
+  * `409 CONFLICT`: Duplicate telemetry events, execution concurrency locks, data integrity constraints (`DUPLICATE_EVENT`, `CONFLICT`).
+  * `415 UNSUPPORTED_MEDIA_TYPE`: Unsupported request body content types (`UNSUPPORTED_MEDIA_TYPE`).
+  * `500 INTERNAL_SERVER_ERROR`: Unexpected internal server failures (`INTERNAL_ERROR`).
+
+### 3. Security Headers & Request Correlation
+
+The `SecurityHeadersFilter` applies OWASP-recommended HTTP response headers on every request:
+
+* `X-Content-Type-Options: nosniff`: Prevents MIME-type sniffing.
+* `X-Frame-Options: DENY`: Protects against clickjacking.
+* `Referrer-Policy: strict-origin-when-cross-origin`: Restricts referrer information leakage.
+* `Content-Security-Policy: default-src 'self'`: Restricts unauthorized script and resource execution.
+* `Permissions-Policy: geolocation=(), camera=(), microphone=()`: Disables browser feature access.
+* `Strict-Transport-Security: max-age=31536000; includeSubDomains`: Emitted strictly when transport is HTTPS or guaranteed by a trusted reverse proxy forwarding `X-Forwarded-Proto: https` (per RFC 6797). Plain HTTP requests do not receive this header.
+* `Cache-Control: no-cache, no-store, max-age=0, must-revalidate` & `Pragma: no-cache`: Applied to all `/api/**` dynamic endpoints to prevent intermediate proxy and browser caching of sensitive telemetry.
+* `X-Correlation-ID`: Incoming `X-Correlation-ID` or `X-Request-ID` headers are validated and propagated across logging MDC and response headers. If missing, a secure UUID is generated.
+
+### 4. Actuator Exposure & Resource Limits
+
+* **Actuator Hardening**:
+  * Only `health`, `info`, and `metrics` endpoints are exposed.
+  * Sensitive endpoints (`env`, `beans`, `mappings`, `configprops`, `heapdump`, `threaddump`) are explicitly disabled (`enabled: false`).
+  * Health details (`show-details: never`) suppress infrastructure credentials and internal component configurations.
+* **Server Request Boundaries**:
+  * `server.tomcat.max-http-form-post-size: 1MB`
+  * `server.tomcat.max-swallow-size: 2MB`
+  * `server.max-http-request-header-size: 8KB`
+  * `spring.servlet.multipart.enabled: false` (disables file uploads).
+
+### 5. CORS & Authentication Architecture
+
+* **Authentication & Authorization Scope**:
+  * Phase 10 provides input boundary validation, OWASP security headers, error message sanitization, and messaging reliability.
+  * ChaosReplay does **not** currently implement internal Authentication (AuthN) or Authorization (AuthZ)—such as OAuth2, JWT validation, or mTLS. It is intended for private network / VPC deployment behind an authenticating API Gateway or Reverse Proxy.
+  * Do not expose endpoints directly to untrusted public networks without upstream gateway authentication.
+* **Configurable CORS**:
+  * Disabled by default (`chaosreplay.security.cors.enabled: false`). Cross-origin browser requests are rejected with `403 Forbidden`, while same-origin requests without an `Origin` header operate normally.
+  * When enabled via `CHAOSREPLAY_CORS_ENABLED=true`, operators must explicitly configure `CHAOSREPLAY_CORS_ALLOWED_ORIGINS` (e.g. `https://internal-dashboard.corp`).
+  * Wildcard `*` origins combined with credentials (`allowCredentials=true`) are explicitly rejected at startup.
+
+### 6. Kafka Reliability & Idempotency Guarantees
+
+* **At-Least-Once Delivery with Idempotent Deduplication**: Telemetry messages delivered multiple times via Kafka are safely absorbed without duplicate rows or consumer crashes.
+* **Direct Dead-Letter Queue (DLQ) Routing**: Poison records, schema validation violations, and malformed JSON bypass retries and route directly to `chaosreplay.telemetry.dlq` with diagnostic headers (`kafka_dlt-*`).
+* **Bounded Retries**: Transient database or network failures use fixed backoff (1000ms, max 3 attempts) before failing over to DLQ.
+
+### 7. Recommended Production Hardening Checklist
+
+When deploying ChaosReplay to a production environment:
+
+1. **TLS Termination**: Terminate TLS 1.3 at the reverse proxy / ingress load balancer (NGINX, Envoy, Traefik, AWS ALB).
+2. **Reverse Proxy Header Trust**: Enable `server.forward-headers-strategy: framework` only behind trusted proxies.
+3. **Authentication Gateway**: Place an OAuth2/OIDC or mTLS proxy in front of `/api/**` to authenticate caller services.
+4. **Network Isolation**: Expose Actuator on an internal management port or restrict `/actuator/**` to cluster-internal monitoring scrapers (Prometheus).
+
+---
+
 ## Packaging & Docker
 
 ### Package JAR:
@@ -869,10 +978,11 @@ docker build -t chaosreplay:latest .
 * **Phase 7 — Incident Timeline & Explainable Failure Insights** *(Completed)*
 * **Phase 8 — Event-Driven Telemetry Ingestion with Kafka** *(Completed)*
 * **Phase 9 — Performance, Caching & Observability** *(Completed)*
-* **Phase 10 — Service Dependency Graph** *(Upcoming)*
-* **Phase 11 — Minimal Reproduction Engine** *(Upcoming)*
-* **Phase 12 — Isolated Replay Engine** *(Upcoming)*
-* **Phase 13 — Chaos Injection** *(Upcoming)*
-* **Phase 14 — Candidate Fix Verification** *(Upcoming)*
-* **Phase 15 — Angular Incident Dashboard** *(Upcoming)*
-* **Phase 16 — Kubernetes/AWS Deployment** *(Upcoming)*
+* **Phase 10 — API Security & Reliability Hardening** *(Completed)*
+* **Phase 11 — Service Dependency Graph** *(Upcoming)*
+* **Phase 12 — Minimal Reproduction Engine** *(Upcoming)*
+* **Phase 13 — Isolated Replay Engine** *(Upcoming)*
+* **Phase 14 — Chaos Injection** *(Upcoming)*
+* **Phase 15 — Candidate Fix Verification** *(Upcoming)*
+* **Phase 16 — Angular Incident Dashboard** *(Upcoming)*
+* **Phase 17 — Kubernetes/AWS Deployment** *(Upcoming)*
