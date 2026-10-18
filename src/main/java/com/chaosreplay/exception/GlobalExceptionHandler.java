@@ -15,16 +15,31 @@ import org.springframework.web.servlet.resource.NoResourceFoundException;
 import java.time.Instant;
 import java.util.stream.Collectors;
 
+import com.chaosreplay.metrics.ChaosReplayMetrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.springframework.beans.factory.annotation.Autowired;
+
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    @Autowired(required = false)
+    private ChaosReplayMetrics metrics = new ChaosReplayMetrics(new SimpleMeterRegistry());
+
+    public GlobalExceptionHandler() {
+    }
+
+    public GlobalExceptionHandler(ChaosReplayMetrics metrics) {
+        this.metrics = metrics != null ? metrics : new ChaosReplayMetrics(new SimpleMeterRegistry());
+    }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ApiErrorResponse> handleValidationException(
             MethodArgumentNotValidException ex,
             HttpServletRequest request
     ) {
+        metrics.recordTelemetryInvalid("validation");
         String validationErrors = ex.getBindingResult()
                 .getFieldErrors()
                 .stream()
@@ -167,6 +182,7 @@ public class GlobalExceptionHandler {
             org.springframework.http.converter.HttpMessageNotReadableException ex,
             HttpServletRequest request
     ) {
+        metrics.recordTelemetryInvalid("malformed");
         String causeMessage = ex.getMostSpecificCause() != null ? ex.getMostSpecificCause().getMessage() : ex.getMessage();
         String message = "Malformed JSON or invalid field value: " + (causeMessage != null ? causeMessage : "Unreadable request");
 

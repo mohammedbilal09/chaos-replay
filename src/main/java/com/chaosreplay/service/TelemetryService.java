@@ -12,6 +12,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import com.chaosreplay.metrics.ChaosReplayMetrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -27,18 +29,20 @@ public class TelemetryService {
     private static final Logger log = LoggerFactory.getLogger(TelemetryService.class);
 
     private final TelemetryEventRepository repository;
+    private final ChaosReplayMetrics metrics;
 
     public TelemetryService(TelemetryEventRepository repository) {
+        this(repository, new ChaosReplayMetrics(new SimpleMeterRegistry()));
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public TelemetryService(TelemetryEventRepository repository, ChaosReplayMetrics metrics) {
         this.repository = repository;
+        this.metrics = metrics != null ? metrics : new ChaosReplayMetrics(new SimpleMeterRegistry());
     }
 
     /**
-     * Ingests a new telemetry event into the platform.
-     * <p>
-     * Employs a two-tier duplicate protection strategy:
-     * 1. Application-level check via {@link TelemetryEventRepository#existsByEventId(String)} for early rejection.
-     * 2. Database UNIQUE constraint as the authoritative safeguard against concurrent race conditions,
-     *    catching {@link DataIntegrityViolationException} and transforming it into {@link DuplicateEventException}.
+     * Ingests a new telemetry event from default REST source.
      *
      * @param request validated event ingestion payload
      * @return persisted telemetry event response DTO
@@ -46,9 +50,34 @@ public class TelemetryService {
      */
     @Transactional
     public TelemetryEventResponse ingestEvent(CreateTelemetryEventRequest request) {
+        return ingestEvent(request, "rest");
+    }
+
+    /**
+     * Ingests a new telemetry event with explicit telemetry source attribution.
+     * <p>
+     * Employs a two-tier duplicate protection strategy:
+     * 1. Application-level check via {@link TelemetryEventRepository#existsByEventId(String)} for early rejection.
+     * 2. Database UNIQUE constraint as the authoritative safeguard against concurrent race conditions,
+     *    catching {@link DataIntegrityViolationException} and transforming it into {@link DuplicateEventException}.
+     *
+     * @param request validated event ingestion payload
+     * @param source  originating transport source (e.g. "rest", "kafka")
+     * @return persisted telemetry event response DTO
+     * @throws DuplicateEventException if an event with the same eventId already exists
+     */
+    @Transactional
+    public TelemetryEventResponse ingestEvent(CreateTelemetryEventRequest request, String source) {
+        String cleanSource = (source != null && !source.isBlank()) ? source.trim() : "rest";
+        long startNanos = System.nanoTime();
+
         // Fast-path early duplicate check
         if (repository.existsByEventId(request.eventId())) {
-            log.warn("Application-level duplicate event rejection for eventId [{}]", request.eventId());
+            long duration = System.nanoTime() - startNanos;
+            metrics.recordTelemetryDuplicate(cleanSource);
+            metrics.recordTelemetryIngestionDuration(cleanSource, "duplicate", duration);
+            log.warn("Application-level duplicate event rejection [eventId={}, traceId={}, source={}, durationMs={}]",
+                    request.eventId(), request.traceId(), cleanSource, duration / 1_000_000);
             throw new DuplicateEventException(request.eventId());
         }
 
@@ -68,13 +97,26 @@ public class TelemetryService {
 
         try {
             TelemetryEvent saved = repository.saveAndFlush(entity);
-            log.info("Ingested telemetry event [eventId={}, service={}, type={}, severity={}]",
-                    saved.getEventId(), saved.getServiceName(), saved.getEventType(), saved.getSeverity());
+            long duration = System.nanoTime() - startNanos;
+            metrics.recordTelemetryIngested(cleanSource, "success");
+            metrics.recordTelemetryIngestionDuration(cleanSource, "success", duration);
+            log.info("Ingested telemetry event [eventId={}, traceId={}, service={}, type={}, severity={}, source={}, durationMs={}]",
+                    saved.getEventId(), saved.getTraceId(), saved.getServiceName(), saved.getEventType(), saved.getSeverity(), cleanSource, duration / 1_000_000);
             return TelemetryEventResponse.fromEntity(saved);
         } catch (DataIntegrityViolationException ex) {
-            log.warn("Authoritative database UNIQUE constraint violation for eventId [{}]: {}",
-                    request.eventId(), ex.getMessage());
+            long duration = System.nanoTime() - startNanos;
+            metrics.recordTelemetryDuplicate(cleanSource);
+            metrics.recordTelemetryIngestionDuration(cleanSource, "duplicate", duration);
+            log.warn("Authoritative database UNIQUE constraint violation [eventId={}, traceId={}, source={}, durationMs={}]: {}",
+                    request.eventId(), request.traceId(), cleanSource, duration / 1_000_000, ex.getMessage());
             throw new DuplicateEventException(request.eventId(), ex);
+        } catch (Exception ex) {
+            long duration = System.nanoTime() - startNanos;
+            metrics.recordTelemetryIngested(cleanSource, "error");
+            metrics.recordTelemetryIngestionDuration(cleanSource, "error", duration);
+            log.error("Failed to persist telemetry event [eventId={}, traceId={}, source={}, durationMs={}]: {}",
+                    request.eventId(), request.traceId(), cleanSource, duration / 1_000_000, ex.getMessage(), ex);
+            throw ex;
         }
     }
 

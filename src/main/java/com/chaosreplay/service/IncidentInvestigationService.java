@@ -33,6 +33,9 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
+import com.chaosreplay.metrics.ChaosReplayMetrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+
 /**
  * Read-only service aggregating telemetry timeline, replay scenarios, simulation execution,
  * verification differences, and deterministic failure analysis into a consolidated investigation view.
@@ -49,6 +52,7 @@ public class IncidentInvestigationService {
     private final FailureAnalysisRepository analysisRepository;
     private final FailureAnalysisCandidateRepository candidateRepository;
     private final FailureAnalysisEvidenceRepository evidenceRepository;
+    private final ChaosReplayMetrics metrics;
 
     public IncidentInvestigationService(
             IncidentTimelineService timelineService,
@@ -59,6 +63,22 @@ public class IncidentInvestigationService {
             FailureAnalysisCandidateRepository candidateRepository,
             FailureAnalysisEvidenceRepository evidenceRepository
     ) {
+        this(timelineService, scenarioRepository, verificationRepository, differenceRepository,
+                analysisRepository, candidateRepository, evidenceRepository,
+                new ChaosReplayMetrics(new SimpleMeterRegistry()));
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public IncidentInvestigationService(
+            IncidentTimelineService timelineService,
+            ReplayScenarioRepository scenarioRepository,
+            ReplayVerificationRepository verificationRepository,
+            ReplayVerificationDifferenceRepository differenceRepository,
+            FailureAnalysisRepository analysisRepository,
+            FailureAnalysisCandidateRepository candidateRepository,
+            FailureAnalysisEvidenceRepository evidenceRepository,
+            ChaosReplayMetrics metrics
+    ) {
         this.timelineService = timelineService;
         this.scenarioRepository = scenarioRepository;
         this.verificationRepository = verificationRepository;
@@ -66,6 +86,7 @@ public class IncidentInvestigationService {
         this.analysisRepository = analysisRepository;
         this.candidateRepository = candidateRepository;
         this.evidenceRepository = evidenceRepository;
+        this.metrics = metrics != null ? metrics : new ChaosReplayMetrics(new SimpleMeterRegistry());
     }
 
     /**
@@ -77,7 +98,9 @@ public class IncidentInvestigationService {
      */
     @Transactional(readOnly = true)
     public IncidentInvestigationResponse getInvestigation(String traceId) {
+        long startNanos = System.nanoTime();
         if (traceId == null || traceId.isBlank()) {
+            metrics.recordInvestigationDuration("not_found", System.nanoTime() - startNanos);
             throw new ResourceNotFoundException("Trace not found: " + traceId);
         }
 
@@ -194,8 +217,10 @@ public class IncidentInvestigationService {
 
         limitations.add("Analysis conclusions and candidates represent deterministic, evidence-backed correlations from observed telemetry and simulated replays; absolute real-world causality is not claimed.");
 
-        log.info("Assembled incident investigation for trace [{}]: analysisAvailable={}, verificationAvailable={}, candidates={}",
-                cleanTraceId, analysisAvailable, verificationAvailable, candidateResponses.size());
+        long duration = System.nanoTime() - startNanos;
+        metrics.recordInvestigationDuration("success", duration);
+        log.info("Assembled incident investigation [traceId={}, analysisAvailable={}, verificationAvailable={}, candidates={}, durationMs={}]",
+                cleanTraceId, analysisAvailable, verificationAvailable, candidateResponses.size(), duration / 1_000_000);
 
         return new IncidentInvestigationResponse(
                 cleanTraceId,

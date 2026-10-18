@@ -39,6 +39,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
+import com.chaosreplay.metrics.ChaosReplayMetrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+
 /**
  * Read-only service reconstructing deterministic, chronological incident timelines
  * from persisted telemetry and enriching entries with persisted analysis and verification evidence.
@@ -55,6 +58,7 @@ public class IncidentTimelineService {
     private final ReplayScenarioRepository scenarioRepository;
     private final ReplayVerificationRepository verificationRepository;
     private final ReplayVerificationDifferenceRepository differenceRepository;
+    private final ChaosReplayMetrics metrics;
 
     public IncidentTimelineService(
             TelemetryEventRepository telemetryRepository,
@@ -65,6 +69,22 @@ public class IncidentTimelineService {
             ReplayVerificationRepository verificationRepository,
             ReplayVerificationDifferenceRepository differenceRepository
     ) {
+        this(telemetryRepository, analysisRepository, candidateRepository, evidenceRepository,
+                scenarioRepository, verificationRepository, differenceRepository,
+                new ChaosReplayMetrics(new SimpleMeterRegistry()));
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public IncidentTimelineService(
+            TelemetryEventRepository telemetryRepository,
+            FailureAnalysisRepository analysisRepository,
+            FailureAnalysisCandidateRepository candidateRepository,
+            FailureAnalysisEvidenceRepository evidenceRepository,
+            ReplayScenarioRepository scenarioRepository,
+            ReplayVerificationRepository verificationRepository,
+            ReplayVerificationDifferenceRepository differenceRepository,
+            ChaosReplayMetrics metrics
+    ) {
         this.telemetryRepository = telemetryRepository;
         this.analysisRepository = analysisRepository;
         this.candidateRepository = candidateRepository;
@@ -72,6 +92,7 @@ public class IncidentTimelineService {
         this.scenarioRepository = scenarioRepository;
         this.verificationRepository = verificationRepository;
         this.differenceRepository = differenceRepository;
+        this.metrics = metrics != null ? metrics : new ChaosReplayMetrics(new SimpleMeterRegistry());
     }
 
     /**
@@ -83,7 +104,9 @@ public class IncidentTimelineService {
      */
     @Transactional(readOnly = true)
     public IncidentTimelineResponse getTimeline(String traceId) {
+        long startNanos = System.nanoTime();
         if (traceId == null || traceId.isBlank()) {
+            metrics.recordTimelineDuration("not_found", System.nanoTime() - startNanos);
             throw new ResourceNotFoundException("Trace not found: " + traceId);
         }
 
@@ -92,7 +115,9 @@ public class IncidentTimelineService {
                 .findAllByTraceIdOrderByTimestampAscEventIdAsc(cleanTraceId);
 
         if (events.isEmpty()) {
-            log.info("No telemetry events found for traceId [{}]", cleanTraceId);
+            long duration = System.nanoTime() - startNanos;
+            metrics.recordTimelineDuration("not_found", duration);
+            log.info("No telemetry events found for traceId [{}] (durationMs={})", cleanTraceId, duration / 1_000_000);
             throw new ResourceNotFoundException("Trace not found: " + cleanTraceId);
         }
 
@@ -221,8 +246,10 @@ public class IncidentTimelineService {
             ));
         }
 
-        log.debug("Built incident timeline for trace [{}] with {} events, {} failures",
-                cleanTraceId, eventCount, failureCount);
+        long duration = System.nanoTime() - startNanos;
+        metrics.recordTimelineDuration("success", duration);
+        log.info("Reconstructed incident timeline [traceId={}, events={}, failures={}, durationMs={}]",
+                cleanTraceId, eventCount, failureCount, duration / 1_000_000);
 
         return new IncidentTimelineResponse(
                 cleanTraceId,

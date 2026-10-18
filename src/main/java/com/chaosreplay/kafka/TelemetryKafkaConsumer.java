@@ -21,6 +21,9 @@ import java.util.stream.Collectors;
  * Delegates to the existing {@link TelemetryService} to enforce identical validation,
  * persistence, trace correlation, and duplicate-event handling.
  */
+import com.chaosreplay.metrics.ChaosReplayMetrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+
 @Service
 @ConditionalOnProperty(name = "chaosreplay.kafka.enabled", havingValue = "true", matchIfMissing = true)
 public class TelemetryKafkaConsumer {
@@ -30,20 +33,32 @@ public class TelemetryKafkaConsumer {
     private final TelemetryService telemetryService;
     private final Validator validator;
     private final ObjectMapper objectMapper;
+    private final ChaosReplayMetrics metrics;
 
     public TelemetryKafkaConsumer(
             TelemetryService telemetryService,
             Validator validator,
             ObjectMapper objectMapper
     ) {
+        this(telemetryService, validator, objectMapper, new ChaosReplayMetrics(new SimpleMeterRegistry()));
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public TelemetryKafkaConsumer(
+            TelemetryService telemetryService,
+            Validator validator,
+            ObjectMapper objectMapper,
+            ChaosReplayMetrics metrics
+    ) {
         this.telemetryService = telemetryService;
         this.validator = validator;
         this.objectMapper = objectMapper;
+        this.metrics = metrics != null ? metrics : new ChaosReplayMetrics(new SimpleMeterRegistry());
     }
 
     /**
      * Consumes telemetry records from Kafka, validates payload integrity, delegates to
-     * {@link TelemetryService#ingestEvent(CreateTelemetryEventRequest)}, and gracefully
+     * {@link TelemetryService#ingestEvent(CreateTelemetryEventRequest, String)}, and gracefully
      * absorbs duplicate events without creating duplicate rows or crashing the consumer.
      *
      * @param record consumed Kafka record containing payload and transport metadata
@@ -53,27 +68,46 @@ public class TelemetryKafkaConsumer {
             groupId = "${chaosreplay.kafka.consumer-group:chaosreplay-telemetry-group}"
     )
     public void consumeTelemetry(ConsumerRecord<String, Object> record) {
+        long startNanos = System.nanoTime();
         Object rawPayload = record.value();
 
         log.debug("Received telemetry record from Kafka [topic={}, partition={}, offset={}, key={}]",
                 record.topic(), record.partition(), record.offset(), record.key());
 
-        TelemetryMessage message = parseMessage(rawPayload, record);
-        validateMessage(message, record);
+        TelemetryMessage message;
+        try {
+            message = parseMessage(rawPayload, record);
+            validateMessage(message, record);
+        } catch (InvalidTelemetryMessageException ex) {
+            long duration = System.nanoTime() - startNanos;
+            metrics.recordKafkaDlq("invalid_message");
+            metrics.recordKafkaConsumed("failure");
+            metrics.recordKafkaConsumptionDuration("failure", duration);
+            throw ex;
+        }
 
         CreateTelemetryEventRequest request = message.toCreateRequest();
 
         try {
             telemetryService.ingestEvent(request);
-            log.info("Successfully ingested Kafka telemetry event [eventId={}, traceId={}, topic={}, partition={}, offset={}]",
-                    message.eventId(), message.traceId(), record.topic(), record.partition(), record.offset());
+            long duration = System.nanoTime() - startNanos;
+            metrics.recordKafkaConsumed("success");
+            metrics.recordKafkaConsumptionDuration("success", duration);
+            log.info("Successfully ingested Kafka telemetry event [eventId={}, traceId={}, topic={}, partition={}, offset={}, durationMs={}]",
+                    message.eventId(), message.traceId(), record.topic(), record.partition(), record.offset(), duration / 1_000_000);
         } catch (DuplicateEventException ex) {
             // Idempotent duplicate delivery: log structured warning and commit offset without failure
-            log.warn("Duplicate telemetry event ignored from Kafka [eventId={}, traceId={}, topic={}, partition={}, offset={}]: {}",
-                    message.eventId(), message.traceId(), record.topic(), record.partition(), record.offset(), ex.getMessage());
+            long duration = System.nanoTime() - startNanos;
+            metrics.recordKafkaConsumed("duplicate");
+            metrics.recordKafkaConsumptionDuration("duplicate", duration);
+            log.warn("Duplicate telemetry event ignored from Kafka [eventId={}, traceId={}, topic={}, partition={}, offset={}, durationMs={}]: {}",
+                    message.eventId(), message.traceId(), record.topic(), record.partition(), record.offset(), duration / 1_000_000, ex.getMessage());
         } catch (Exception ex) {
-            log.error("Failed to ingest telemetry event from Kafka [eventId={}, traceId={}, topic={}, partition={}, offset={}]: {}",
-                    message.eventId(), message.traceId(), record.topic(), record.partition(), record.offset(), ex.getMessage(), ex);
+            long duration = System.nanoTime() - startNanos;
+            metrics.recordKafkaConsumed("failure");
+            metrics.recordKafkaConsumptionDuration("failure", duration);
+            log.error("Failed to ingest telemetry event from Kafka [eventId={}, traceId={}, topic={}, partition={}, offset={}, durationMs={}]: {}",
+                    message.eventId(), message.traceId(), record.topic(), record.partition(), record.offset(), duration / 1_000_000, ex.getMessage(), ex);
             throw ex;
         }
     }

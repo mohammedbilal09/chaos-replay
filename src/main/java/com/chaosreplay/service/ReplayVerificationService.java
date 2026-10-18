@@ -38,6 +38,9 @@ import java.util.stream.Collectors;
  * Compares persisted ReplayScenarioEvent snapshots against simulated ReplayObservedEvent observations.
  * Verification is strictly simulation-only and preserves the immutability of TelemetryEvent and ReplayScenario.
  */
+import com.chaosreplay.metrics.ChaosReplayMetrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+
 @Service
 public class ReplayVerificationService {
 
@@ -47,6 +50,7 @@ public class ReplayVerificationService {
     private final ReplayScenarioEventRepository scenarioEventRepository;
     private final ReplayVerificationRepository verificationRepository;
     private final ReplayVerificationDifferenceRepository differenceRepository;
+    private final ChaosReplayMetrics metrics;
 
     public ReplayVerificationService(
             ReplayScenarioRepository scenarioRepository,
@@ -54,10 +58,23 @@ public class ReplayVerificationService {
             ReplayVerificationRepository verificationRepository,
             ReplayVerificationDifferenceRepository differenceRepository
     ) {
+        this(scenarioRepository, scenarioEventRepository, verificationRepository, differenceRepository,
+                new ChaosReplayMetrics(new SimpleMeterRegistry()));
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public ReplayVerificationService(
+            ReplayScenarioRepository scenarioRepository,
+            ReplayScenarioEventRepository scenarioEventRepository,
+            ReplayVerificationRepository verificationRepository,
+            ReplayVerificationDifferenceRepository differenceRepository,
+            ChaosReplayMetrics metrics
+    ) {
         this.scenarioRepository = scenarioRepository;
         this.scenarioEventRepository = scenarioEventRepository;
         this.verificationRepository = verificationRepository;
         this.differenceRepository = differenceRepository;
+        this.metrics = metrics != null ? metrics : new ChaosReplayMetrics(new SimpleMeterRegistry());
     }
 
     /**
@@ -112,7 +129,9 @@ public class ReplayVerificationService {
             List<ReplayObservedEvent> observedEvents,
             long replayedDurationMs
     ) {
+        long startNanos = System.nanoTime();
         if (scenarioId == null || scenarioId.isBlank()) {
+            metrics.recordReplayVerification("error", System.nanoTime() - startNanos);
             throw new ResourceNotFoundException("Scenario not found with id: " + scenarioId);
         }
 
@@ -138,8 +157,10 @@ public class ReplayVerificationService {
             ReplayVerification existing = existingOpt.get();
             List<ReplayVerificationDifference> diffs = differenceRepository
                     .findAllByVerificationIdOrderBySequenceNumberAsc(verificationId);
-            log.info("Idempotent replay verification retrieved for scenario [{}] with verificationId [{}]",
-                    cleanScenarioId, verificationId);
+            long duration = System.nanoTime() - startNanos;
+            metrics.recordReplayVerification(existing.getStatus().name(), duration);
+            log.info("Idempotent replay verification retrieved [scenario={}, verificationId={}, status={}, durationMs={}]",
+                    cleanScenarioId, verificationId, existing.getStatus(), duration / 1_000_000);
             return new ReplayVerificationResult(ReplayVerificationResponse.from(existing, diffs), false);
         }
 
@@ -362,8 +383,10 @@ public class ReplayVerificationService {
                 ? Collections.emptyList()
                 : differenceRepository.saveAllAndFlush(differences);
 
-        log.info("Persisted replay verification [{}] for scenario [{}] with status [{}] and {} differences",
-                verificationId, cleanScenarioId, status, savedDifferences.size());
+        long duration = System.nanoTime() - startNanos;
+        metrics.recordReplayVerification(status.name(), duration);
+        log.info("Persisted replay verification [scenario={}, verificationId={}, status={}, differences={}, durationMs={}]",
+                cleanScenarioId, verificationId, status, savedDifferences.size(), duration / 1_000_000);
 
         return new ReplayVerificationResult(
                 ReplayVerificationResponse.from(savedVerification, savedDifferences),

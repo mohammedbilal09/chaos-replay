@@ -46,6 +46,9 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
+import com.chaosreplay.metrics.ChaosReplayMetrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+
 /**
  * Service providing deterministic, evidence-backed failure analysis across correlated telemetry,
  * failure reconstructions, replay scenarios, and verification differences.
@@ -63,6 +66,7 @@ public class FailureAnalysisService {
     private final FailureAnalysisRepository analysisRepository;
     private final FailureAnalysisCandidateRepository candidateRepository;
     private final FailureAnalysisEvidenceRepository evidenceRepository;
+    private final ChaosReplayMetrics metrics;
 
     public FailureAnalysisService(
             TelemetryEventRepository telemetryRepository,
@@ -73,6 +77,22 @@ public class FailureAnalysisService {
             FailureAnalysisCandidateRepository candidateRepository,
             FailureAnalysisEvidenceRepository evidenceRepository
     ) {
+        this(telemetryRepository, scenarioRepository, verificationRepository, differenceRepository,
+                analysisRepository, candidateRepository, evidenceRepository,
+                new ChaosReplayMetrics(new SimpleMeterRegistry()));
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public FailureAnalysisService(
+            TelemetryEventRepository telemetryRepository,
+            ReplayScenarioRepository scenarioRepository,
+            ReplayVerificationRepository verificationRepository,
+            ReplayVerificationDifferenceRepository differenceRepository,
+            FailureAnalysisRepository analysisRepository,
+            FailureAnalysisCandidateRepository candidateRepository,
+            FailureAnalysisEvidenceRepository evidenceRepository,
+            ChaosReplayMetrics metrics
+    ) {
         this.telemetryRepository = telemetryRepository;
         this.scenarioRepository = scenarioRepository;
         this.verificationRepository = verificationRepository;
@@ -80,6 +100,7 @@ public class FailureAnalysisService {
         this.analysisRepository = analysisRepository;
         this.candidateRepository = candidateRepository;
         this.evidenceRepository = evidenceRepository;
+        this.metrics = metrics != null ? metrics : new ChaosReplayMetrics(new SimpleMeterRegistry());
     }
 
     /**
@@ -92,7 +113,9 @@ public class FailureAnalysisService {
      */
     @Transactional
     public AnalysisResult analyzeTrace(String traceId) {
+        long startNanos = System.nanoTime();
         if (traceId == null || traceId.isBlank()) {
+            metrics.recordAnalysis("not_found", System.nanoTime() - startNanos);
             throw new ResourceNotFoundException("Trace not found: " + traceId);
         }
 
@@ -101,7 +124,9 @@ public class FailureAnalysisService {
                 .findAllByTraceIdOrderByTimestampAscEventIdAsc(cleanTraceId);
 
         if (events.isEmpty()) {
-            log.info("Cannot perform failure analysis: no telemetry events found for traceId [{}]", cleanTraceId);
+            long duration = System.nanoTime() - startNanos;
+            metrics.recordAnalysis("not_found", duration);
+            log.info("Cannot perform failure analysis: no telemetry events found for traceId [{}] (durationMs={})", cleanTraceId, duration / 1_000_000);
             throw new ResourceNotFoundException("Trace not found: " + cleanTraceId);
         }
 
@@ -137,8 +162,10 @@ public class FailureAnalysisService {
         Optional<FailureAnalysis> existingOpt = analysisRepository.findByAnalysisId(analysisId);
         if (existingOpt.isPresent()) {
             FailureAnalysis existing = existingOpt.get();
-            log.info("Idempotent failure analysis retrieved for trace [{}] with analysisId [{}]",
-                    cleanTraceId, analysisId);
+            long duration = System.nanoTime() - startNanos;
+            metrics.recordAnalysis(existing.getStatus().name(), duration);
+            log.info("Idempotent failure analysis retrieved [traceId={}, analysisId={}, status={}, durationMs={}]",
+                    cleanTraceId, analysisId, existing.getStatus(), duration / 1_000_000);
             List<FailureAnalysisCandidateResponse> candidateResponses = loadCandidateResponses(analysisId);
             return new AnalysisResult(FailureAnalysisResponse.from(existing, candidateResponses), false);
         }
@@ -295,8 +322,10 @@ public class FailureAnalysisService {
             candidateResponses.add(FailureAnalysisCandidateResponse.from(candidateEntity, evidenceResponses));
         }
 
-        log.info("Persisted failure analysis [{}] for trace [{}] with conclusion [{}] and {} candidates",
-                analysisId, cleanTraceId, conclusion, candidateCount);
+        long duration = System.nanoTime() - startNanos;
+        metrics.recordAnalysis(savedAnalysis.getStatus().name(), duration);
+        log.info("Persisted failure analysis [traceId={}, analysisId={}, status={}, conclusion={}, candidates={}, durationMs={}]",
+                cleanTraceId, analysisId, savedAnalysis.getStatus(), conclusion, candidateCount, duration / 1_000_000);
 
         return new AnalysisResult(FailureAnalysisResponse.from(savedAnalysis, candidateResponses), true);
     }
