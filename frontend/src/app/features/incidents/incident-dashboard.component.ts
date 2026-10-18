@@ -1,6 +1,7 @@
-import { Component, OnInit, OnDestroy } from '@angular/core';
+import { Component, OnInit, OnDestroy, Optional } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { ActivatedRoute } from '@angular/router';
 import { Subject, Subscription, EMPTY } from 'rxjs';
 import { switchMap, tap, catchError } from 'rxjs/operators';
 import { ApiService } from '../../core/services/api.service';
@@ -644,11 +645,28 @@ export class IncidentDashboardComponent implements OnInit, OnDestroy {
   private searchSubject = new Subject<string>();
   private searchSubscription?: Subscription;
 
-  constructor(private api: ApiService) {}
+  constructor(
+    private api: ApiService,
+    @Optional() private route?: ActivatedRoute
+  ) {}
 
   ngOnInit(): void {
     this.checkBackendHealth();
     this.setupSearchStream();
+
+    if (this.route) {
+      this.route.queryParams.subscribe(params => {
+        const trace = params['trace'];
+        const tab = params['tab'];
+        if (tab && (tab === 'timeline' || tab === 'evidence' || tab === 'replay')) {
+          this.activeTab = tab;
+        }
+        if (trace && /^[a-zA-Z0-9-_.:]{1,64}$/.test(trace.trim())) {
+          this.traceIdInput = trace.trim();
+          this.searchSubject.next(this.traceIdInput);
+        }
+      });
+    }
   }
 
   ngOnDestroy(): void {
@@ -689,7 +707,9 @@ export class IncidentDashboardComponent implements OnInit, OnDestroy {
         next: data => {
           this.investigation = data;
           this.isLoading = false;
-          this.activeTab = 'timeline';
+          if (!this.activeTab) {
+            this.activeTab = 'timeline';
+          }
           this.highlightedEventId = undefined;
         }
       });
