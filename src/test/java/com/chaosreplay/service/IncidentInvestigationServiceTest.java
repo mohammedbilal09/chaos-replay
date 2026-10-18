@@ -354,4 +354,39 @@ class IncidentInvestigationServiceTest {
         verify(analysisRepository, never()).save(any());
         verify(analysisRepository, never()).saveAndFlush(any());
     }
+
+    @Test
+    @DisplayName("11. Clock-skew limitation is explicitly reported in investigation limitations")
+    void clockSkewLimitation_alwaysReported() {
+        String traceId = "trace-skew-lim-01";
+        IncidentTimelineResponse timeline = createDummyTimeline(traceId, true);
+
+        when(timelineService.getTimeline(traceId)).thenReturn(timeline);
+        when(timelineService.hasCausalTimestampAnomaly(traceId)).thenReturn(false);
+        when(scenarioRepository.findFirstBySourceTraceIdOrderByCreatedAtDesc(traceId)).thenReturn(Optional.empty());
+        when(analysisRepository.findFirstByTraceIdOrderByCreatedAtDesc(traceId)).thenReturn(Optional.empty());
+
+        IncidentInvestigationResponse response = investigationService.getInvestigation(traceId);
+
+        assertThat(response.limitations())
+                .anyMatch(l -> l.contains("Telemetry timestamps reflect producer host clocks")
+                        && l.contains("do not correct for inter-service clock skew"));
+    }
+
+    @Test
+    @DisplayName("12. Causal timestamp anomaly detected is explicitly reported in investigation limitations")
+    void causalTimestampAnomaly_reportedInLimitations() {
+        String traceId = "trace-skew-anomaly-01";
+        IncidentTimelineResponse timeline = createDummyTimeline(traceId, true);
+
+        when(timelineService.getTimeline(traceId)).thenReturn(timeline);
+        when(timelineService.hasCausalTimestampAnomaly(traceId)).thenReturn(true);
+        when(scenarioRepository.findFirstBySourceTraceIdOrderByCreatedAtDesc(traceId)).thenReturn(Optional.empty());
+        when(analysisRepository.findFirstByTraceIdOrderByCreatedAtDesc(traceId)).thenReturn(Optional.empty());
+
+        IncidentInvestigationResponse response = investigationService.getInvestigation(traceId);
+
+        assertThat(response.limitations())
+                .anyMatch(l -> l.contains("Potential cross-service clock anomaly detected"));
+    }
 }

@@ -430,16 +430,17 @@ public class FailureAnalysisService {
             return FailureCandidateType.EXTERNAL_DEPENDENCY_FAILURE;
         }
 
+        if (isSubsequentFailure && !Objects.equals(event.getServiceName(), firstFailure.getServiceName())
+                && hasPropagationSignal(event, firstFailure)) {
+            return FailureCandidateType.DOWNSTREAM_FAILURE;
+        }
+
         if (hasTimeoutSignal(event)) {
             return FailureCandidateType.TIMEOUT;
         }
 
         if (event.getEventType() == EventType.ERROR) {
             return FailureCandidateType.APPLICATION_ERROR;
-        }
-
-        if (isSubsequentFailure && !Objects.equals(event.getServiceName(), firstFailure.getServiceName())) {
-            return FailureCandidateType.DOWNSTREAM_FAILURE;
         }
 
         if (isFailureSeverity(event.getSeverity())) {
@@ -505,10 +506,6 @@ public class FailureAnalysisService {
             evidence.add(new EvidenceDraft(
                     FailureEvidenceType.SERVICE_PROPAGATION,
                     "Potential downstream propagation from " + firstFailure.getServiceName() + " to " + event.getServiceName()
-            ));
-            evidence.add(new EvidenceDraft(
-                    FailureEvidenceType.TEMPORAL_PRECEDENCE,
-                    "Event followed earlier failure event " + firstFailure.getEventId()
             ));
         }
 
@@ -590,6 +587,111 @@ public class FailureAnalysisService {
                 }
             }
         }
+        return false;
+    }
+
+    static boolean hasPropagationSignal(TelemetryEvent event, TelemetryEvent firstFailure) {
+        if (event == null || firstFailure == null) {
+            return false;
+        }
+        if (Objects.equals(event.getEventId(), firstFailure.getEventId())) {
+            return false;
+        }
+
+        String msg = event.getMessage() != null ? event.getMessage().toLowerCase(Locale.ROOT) : "";
+        String upstreamService = firstFailure.getServiceName() != null
+                ? firstFailure.getServiceName().toLowerCase(Locale.ROOT)
+                : "";
+        String serviceStem = !upstreamService.isBlank()
+                ? upstreamService.replaceAll("[-_](service|svc|api|app)$", "")
+                : "";
+
+        // 1. Explicit contextual propagation phrases in message
+        if (msg.contains("downstream error") || msg.contains("downstream failure")
+                || msg.contains("downstream exception") || msg.contains("downstream timeout")
+                || msg.contains("downstream database") || msg.contains("downstream call")
+                || msg.contains("downstream service")
+                || msg.contains("cascading failure") || msg.contains("cascading error")
+                || msg.contains("cascade failure")
+                || msg.contains("caused by") || msg.contains("failed due to")
+                || msg.contains("upstream failure") || msg.contains("upstream error")
+                || msg.contains("upstream timeout") || msg.contains("upstream service")
+                || msg.contains("dependency failure") || msg.contains("dependency error")
+                || msg.contains("dependency timeout")
+                || msg.contains("propagation") || msg.contains("propagated")) {
+            return true;
+        }
+
+        // 2. Direct reference to upstream service or stem paired with failure context
+        if (!upstreamService.isBlank() && msg.contains(upstreamService)) {
+            if (msg.contains("failed") || msg.contains("error") || msg.contains("timeout")
+                    || msg.contains("timed out") || msg.contains("exception") || msg.contains("unavailable")
+                    || msg.contains("refused") || msg.contains("downstream") || msg.contains("upstream")
+                    || msg.contains("call")) {
+                return true;
+            }
+        }
+
+        if (!serviceStem.isBlank() && serviceStem.length() >= 3) {
+            if (msg.contains(serviceStem + " failed") || msg.contains(serviceStem + " error")
+                    || msg.contains(serviceStem + " timeout") || msg.contains(serviceStem + " timed out")
+                    || msg.contains(serviceStem + " unavailable") || msg.contains(serviceStem + " exception")
+                    || msg.contains(serviceStem + " service") || msg.contains("call to " + serviceStem)
+                    || msg.contains("calling " + serviceStem)) {
+                return true;
+            }
+        }
+
+        // 3. Metadata propagation indicators
+        Map<String, Object> meta = event.getMetadata();
+        if (meta != null && !meta.isEmpty()) {
+            for (Map.Entry<String, Object> entry : meta.entrySet()) {
+                String key = entry.getKey().toLowerCase(Locale.ROOT);
+                String val = String.valueOf(entry.getValue()).toLowerCase(Locale.ROOT);
+
+                // Explicit propagation keys
+                if (key.contains("propagation") || key.contains("downstream") || key.contains("upstream")
+                        || key.contains("causedby") || key.contains("sourceerror")) {
+                    return true;
+                }
+
+                // Service linkage keys that match the upstream service or stem
+                if (key.contains("targetservice") || key.contains("dependencyservice") || key.contains("sourceservice")) {
+                    if (!upstreamService.isBlank() && (val.contains(upstreamService) || (!serviceStem.isBlank() && val.contains(serviceStem)))) {
+                        return true;
+                    }
+                }
+
+                // Explicit propagation values
+                if (val.contains("downstream error") || val.contains("downstream failure")
+                        || val.contains("cascading failure") || val.contains("caused by")
+                        || val.contains("upstream failure") || val.contains("upstream error")
+                        || val.contains("propagated")) {
+                    return true;
+                }
+            }
+
+            // HTTP 502/503/504 as supporting signal only when combined with gateway/proxy/upstream/downstream context
+            Object httpStatusObj = meta.get("httpStatus");
+            if (httpStatusObj != null) {
+                int status = 0;
+                if (httpStatusObj instanceof Number num) {
+                    status = num.intValue();
+                } else {
+                    try {
+                        status = Integer.parseInt(httpStatusObj.toString().trim());
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+                if ((status == 502 || status == 503 || status == 504)
+                        && (msg.contains("gateway") || msg.contains("bad gateway") || msg.contains("service unavailable")
+                        || msg.contains("upstream") || msg.contains("timeout") || msg.contains("proxy")
+                        || msg.contains("downstream"))) {
+                    return true;
+                }
+            }
+        }
+
         return false;
     }
 

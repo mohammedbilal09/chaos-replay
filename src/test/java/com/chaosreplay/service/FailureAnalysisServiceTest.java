@@ -327,7 +327,7 @@ class FailureAnalysisServiceTest {
         assertThat(candidates.get(0).rank()).isEqualTo(1);
         assertThat(candidates.get(0).candidateType()).isEqualTo(FailureCandidateType.DATABASE_FAILURE);
         assertThat(candidates.get(1).rank()).isEqualTo(2);
-        assertThat(candidates.get(1).candidateType()).isEqualTo(FailureCandidateType.DOWNSTREAM_FAILURE);
+        assertThat(candidates.get(1).candidateType()).isEqualTo(FailureCandidateType.SERVICE_FAILURE);
     }
 
     @Test
@@ -560,6 +560,132 @@ class FailureAnalysisServiceTest {
                 FailureAnalysisConclusion.ROOT_CAUSE_CANDIDATE,
                 FailureAnalysisConclusion.MULTIPLE_POSSIBLE_CAUSES
         );
+    }
+
+    @Test
+    @DisplayName("19. Independent failures across services without propagation signals are not classified as downstream")
+    void independentFailuresAcrossServices_classifiedByActualTypeWithoutPropagation() {
+        String traceId = "trace-indep-01";
+        Instant t0 = Instant.parse("2026-09-23T10:00:00Z");
+        Instant t1 = Instant.parse("2026-09-23T10:00:00.050Z");
+
+        List<TelemetryEvent> events = List.of(
+                createEvent("evt-1", t0, "order-service", EventType.DATABASE, Severity.ERROR, traceId, "query", "Database lock acquired failed", Map.of()),
+                createEvent("evt-2", t1, "payment-service", EventType.ERROR, Severity.ERROR, traceId, "process", "NullPointerException in validator", Map.of())
+        );
+
+        when(telemetryRepository.findAllByTraceIdOrderByTimestampAscEventIdAsc(traceId)).thenReturn(events);
+        when(scenarioRepository.findFirstBySourceTraceIdOrderByCreatedAtAsc(traceId)).thenReturn(Optional.empty());
+        when(analysisRepository.findByAnalysisId(anyString())).thenReturn(Optional.empty());
+        when(analysisRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        var result = analysisService.analyzeTrace(traceId);
+
+        var candidates = result.response().candidates();
+        assertThat(candidates).hasSize(2);
+        assertThat(candidates.get(0).candidateType()).isEqualTo(FailureCandidateType.DATABASE_FAILURE);
+        assertThat(candidates.get(1).candidateType()).isEqualTo(FailureCandidateType.APPLICATION_ERROR);
+        assertThat(candidates.get(1).evidence())
+                .extracting(e -> e.evidenceType().name())
+                .doesNotContain("DOWNSTREAM_ERROR", "SERVICE_PROPAGATION", "TEMPORAL_PRECEDENCE");
+    }
+
+    @Test
+    @DisplayName("20. Downstream failure with explicit propagation evidence is classified as DOWNSTREAM_FAILURE without temporal precedence bonus")
+    void downstreamFailureWithPropagationEvidence_classifiedAsDownstreamFailure() {
+        String traceId = "trace-down-prop-01";
+        Instant t0 = Instant.parse("2026-09-23T10:00:00Z");
+        Instant t1 = Instant.parse("2026-09-23T10:00:00.050Z");
+
+        List<TelemetryEvent> events = List.of(
+                createEvent("evt-1", t0, "order-service", EventType.DATABASE, Severity.ERROR, traceId, "query", "Database lock acquired failed", Map.of()),
+                createEvent("evt-2", t1, "api-gateway", EventType.RESPONSE, Severity.ERROR, traceId, "checkout", "Cascading failure: order-service downstream error 500", Map.of())
+        );
+
+        when(telemetryRepository.findAllByTraceIdOrderByTimestampAscEventIdAsc(traceId)).thenReturn(events);
+        when(scenarioRepository.findFirstBySourceTraceIdOrderByCreatedAtAsc(traceId)).thenReturn(Optional.empty());
+        when(analysisRepository.findByAnalysisId(anyString())).thenReturn(Optional.empty());
+        when(analysisRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        var result = analysisService.analyzeTrace(traceId);
+
+        var candidates = result.response().candidates();
+        assertThat(candidates).hasSize(2);
+        var downstream = candidates.get(1);
+        assertThat(downstream.candidateType()).isEqualTo(FailureCandidateType.DOWNSTREAM_FAILURE);
+        assertThat(downstream.evidence())
+                .extracting(e -> e.evidenceType().name())
+                .contains("DOWNSTREAM_ERROR", "SERVICE_PROPAGATION")
+                .doesNotContain("TEMPORAL_PRECEDENCE");
+    }
+
+    @Test
+    @DisplayName("21. Multiple independent failures with close scores produce MULTIPLE_POSSIBLE_CAUSES conclusion")
+    void multipleIndependentFailures_produceMultiplePossibleCauses() {
+        String traceId = "trace-indep-causes-01";
+        String scenarioId = "scen-indep-01";
+        String verificationId = "verif-indep-01";
+        Instant t0 = Instant.parse("2026-09-23T10:00:00Z");
+        Instant t1 = Instant.parse("2026-09-23T10:00:00.020Z");
+
+        // evt-1: EXTERNAL_CALL (0.85) + FIRST (0.05) + PRECEDENCE (0.03) = 0.9300
+        // evt-2: EXTERNAL_CALL (0.85) + REPLAY_MISMATCH (0.05) + METADATA (0.03) = 0.9300
+        // Score difference is 0.0000 (< 0.05 threshold) -> MULTIPLE_POSSIBLE_CAUSES
+        List<TelemetryEvent> events = List.of(
+                createEvent("evt-1", t0, "auth-service", EventType.EXTERNAL_CALL, Severity.ERROR, traceId, "validate", "Auth provider timeout", Map.of()),
+                createEvent("evt-2", t1, "billing-service", EventType.EXTERNAL_CALL, Severity.ERROR, traceId, "charge", "Card provider timeout", Map.of("retryCount", 3))
+        );
+
+        ReplayScenario scenario = new ReplayScenario(scenarioId, traceId, 2, 2, 50L, ReplayScenarioStatus.COMPLETED);
+        ReplayVerification verification = new ReplayVerification(
+                verificationId, scenarioId, ReplayVerificationStatus.FAILED,
+                2, 2, 1, 1, 50L, 50L, 0, 0, 1, 1, 0, 0, "Divergence"
+        );
+        ReplayVerificationDifference diff = new ReplayVerificationDifference(
+                verificationId, 1, VerificationDifferenceType.SEVERITY_MISMATCH,
+                "evt-2", "evt-2", "billing-service", "billing-service", "EXTERNAL_CALL", "EXTERNAL_CALL", "ERROR", "WARN", "Severity differed"
+        );
+
+        when(telemetryRepository.findAllByTraceIdOrderByTimestampAscEventIdAsc(traceId)).thenReturn(events);
+        when(scenarioRepository.findFirstBySourceTraceIdOrderByCreatedAtAsc(traceId)).thenReturn(Optional.of(scenario));
+        when(verificationRepository.findAllByScenarioIdOrderByCreatedAtDesc(scenarioId)).thenReturn(List.of(verification));
+        when(differenceRepository.findAllByVerificationIdOrderBySequenceNumberAsc(verificationId)).thenReturn(List.of(diff));
+        when(analysisRepository.findByAnalysisId(anyString())).thenReturn(Optional.empty());
+        when(analysisRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        var result = analysisService.analyzeTrace(traceId);
+
+        assertThat(result.response().candidateCount()).isEqualTo(2);
+        assertThat(result.response().conclusion()).isEqualTo(FailureAnalysisConclusion.MULTIPLE_POSSIBLE_CAUSES);
+        assertThat(result.response().candidates().get(0).confidenceScore()).isEqualTo(new BigDecimal("0.9300"));
+        assertThat(result.response().candidates().get(1).confidenceScore()).isEqualTo(new BigDecimal("0.9300"));
+    }
+
+    @Test
+    @DisplayName("22. Confidence score is calculated dynamically from base score and empirical evidence bonuses")
+    void confidenceScore_calculatedDynamicallyFromFormula() {
+        String traceId = "trace-dynamic-formula-01";
+        Instant t0 = Instant.parse("2026-09-23T10:00:00Z");
+        Instant t1 = Instant.parse("2026-09-23T10:00:00.050Z");
+
+        // Primary: DATABASE_FAILURE base (0.85) + FIRST_FAILURE (0.05) + TEMPORAL_PRECEDENCE (0.03) + metadata (0.03) = 0.9600
+        // Secondary: DOWNSTREAM_FAILURE base (0.55) + no bonuses = 0.5500
+        List<TelemetryEvent> events = List.of(
+                createEvent("evt-1", t0, "order-service", EventType.DATABASE, Severity.ERROR, traceId, "UPDATE inventory", "Deadlock", Map.of("timeoutMs", 3000)),
+                createEvent("evt-2", t1, "api-gateway", EventType.RESPONSE, Severity.ERROR, traceId, "POST /order", "Downstream error from order-service", Map.of())
+        );
+
+        when(telemetryRepository.findAllByTraceIdOrderByTimestampAscEventIdAsc(traceId)).thenReturn(events);
+        when(scenarioRepository.findFirstBySourceTraceIdOrderByCreatedAtAsc(traceId)).thenReturn(Optional.empty());
+        when(analysisRepository.findByAnalysisId(anyString())).thenReturn(Optional.empty());
+        when(analysisRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+
+        var result = analysisService.analyzeTrace(traceId);
+
+        var candidates = result.response().candidates();
+        assertThat(candidates).hasSize(2);
+        assertThat(candidates.get(0).confidenceScore()).isEqualTo(new BigDecimal("0.9600"));
+        assertThat(candidates.get(1).confidenceScore()).isEqualTo(new BigDecimal("0.5500"));
     }
 }
 

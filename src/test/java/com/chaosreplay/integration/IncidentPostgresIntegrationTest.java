@@ -9,6 +9,7 @@ import com.chaosreplay.api.dto.ReplayVerificationResponse;
 import com.chaosreplay.domain.EventType;
 import com.chaosreplay.domain.FailureAnalysisConclusion;
 import com.chaosreplay.domain.FailureAnalysisStatus;
+import com.chaosreplay.domain.FailureCandidateType;
 import com.chaosreplay.domain.IncidentEntryCategory;
 import com.chaosreplay.domain.ReplayScenarioStatus;
 import com.chaosreplay.domain.ReplayVerificationStatus;
@@ -329,5 +330,121 @@ class IncidentPostgresIntegrationTest {
         assertThat(investigation.candidates()).hasSize(2);
         assertThat(investigation.evidenceSummary()).isNotEmpty();
         assertThat(investigation.limitations()).isNotEmpty();
+    }
+
+    @Test
+    @DisplayName("6. Real PostgreSQL: 800ms database timeout scenario with subsequent independent error - not falsely blamed")
+    void databaseTimeout800ms_withIndependentSubsequentError_notFalselyBlamed() {
+        String traceId = "trace-pg-800ms-indep";
+        Instant t0 = Instant.parse("2026-10-18T10:00:00.000Z");
+        Instant t1 = Instant.parse("2026-10-18T10:00:00.080Z");
+        Instant t2 = Instant.parse("2026-10-18T10:00:00.800Z"); // +800ms database timeout
+        Instant t3 = Instant.parse("2026-10-18T10:00:00.860Z"); // +860ms independent failure
+
+        // 1. Ingest telemetry matching the original 800ms incident
+        ingestEvent("evt-1", t0, "order-service", EventType.REQUEST, Severity.INFO, traceId,
+                "POST /api/orders", "Order placement initiated", Map.of("cartId", "cart-1"));
+        ingestEvent("evt-2", t1, "inventory-service", EventType.EXTERNAL_CALL, Severity.INFO, traceId,
+                "reserveStock", "Reserving stock for SKU catalog", Map.of("sku", "SKU-9901"));
+        ingestEvent("evt-3", t2, "inventory-service", EventType.DATABASE, Severity.FATAL, traceId,
+                "UPDATE inventory", "Database query timed out after 3000ms: Lock wait timeout exceeded",
+                Map.of("table", "inventory_locks", "timeoutMs", 3000));
+        // Independent error in notification-service with no propagation evidence
+        ingestEvent("evt-4", t3, "notification-service", EventType.REQUEST, Severity.ERROR, traceId,
+                "POST /alerts", "Email provider authentication failed: invalid api token",
+                Map.of("authError", true));
+
+        // 2. Perform full failure analysis
+        FailureAnalysisResponse analysisResp = failureAnalysisService.analyzeTrace(traceId).response();
+
+        // 3. Inspect timeline
+        IncidentTimelineResponse timeline = timelineService.getTimeline(traceId);
+        assertThat(timeline.eventCount()).isEqualTo(4);
+        assertThat(timeline.failureCount()).isEqualTo(2);
+        assertThat(timeline.durationMs()).isEqualTo(860L);
+
+        // Assert database timeout event: accurately reported at +800ms, FATAL severity, DATABASE_FAILURE
+        var dbEntry = timeline.timeline().get(2);
+        assertThat(dbEntry.eventId()).isEqualTo("evt-3");
+        assertThat(dbEntry.offsetMs()).isEqualTo(800L);
+        assertThat(dbEntry.serviceName()).isEqualTo("inventory-service");
+        assertThat(dbEntry.entryCategory()).isEqualTo(IncidentEntryCategory.DATABASE_FAILURE);
+        assertThat(dbEntry.failureObserved()).isTrue();
+        assertThat(dbEntry.failurePropagation()).isFalse();
+
+        // Assert subsequent independent error at +860ms: NOT classified as downstream failure
+        var indepEntry = timeline.timeline().get(3);
+        assertThat(indepEntry.eventId()).isEqualTo("evt-4");
+        assertThat(indepEntry.offsetMs()).isEqualTo(860L);
+        assertThat(indepEntry.serviceName()).isEqualTo("notification-service");
+        assertThat(indepEntry.entryCategory()).isEqualTo(IncidentEntryCategory.ERROR_EVENT);
+        assertThat(indepEntry.failurePropagation()).isFalse(); // CRITICAL: Not falsely marked as propagation
+
+        // Assert analysis candidate classification
+        var indepCandidate = analysisResp.candidates().stream()
+                .filter(c -> c.eventId().equals("evt-4"))
+                .findFirst()
+                .orElseThrow();
+        assertThat(indepCandidate.candidateType()).isNotEqualTo(FailureCandidateType.DOWNSTREAM_FAILURE);
+
+        // 4. Inspect consolidated investigation
+        IncidentInvestigationResponse investigation = investigationService.getInvestigation(traceId);
+        assertThat(investigation.timeline().timeline().get(2).offsetMs()).isEqualTo(800L);
+        assertThat(investigation.limitations())
+                .anyMatch(l -> l.contains("clock skew") || l.contains("relative offsets"));
+    }
+
+    @Test
+    @DisplayName("7. Real PostgreSQL: 800ms database timeout scenario with explicit propagation - correctly classified downstream")
+    void databaseTimeout800ms_withExplicitPropagation_correctlyClassified() {
+        String traceId = "trace-pg-800ms-prop";
+        Instant t0 = Instant.parse("2026-10-18T10:00:00.000Z");
+        Instant t1 = Instant.parse("2026-10-18T10:00:00.080Z");
+        Instant t2 = Instant.parse("2026-10-18T10:00:00.800Z"); // +800ms database timeout
+        Instant t3 = Instant.parse("2026-10-18T10:00:00.860Z"); // +860ms downstream error
+
+        // 1. Ingest telemetry matching the original 800ms incident
+        ingestEvent("evt-1", t0, "order-service", EventType.REQUEST, Severity.INFO, traceId,
+                "POST /api/orders", "Order placement initiated", Map.of("cartId", "cart-1"));
+        ingestEvent("evt-2", t1, "inventory-service", EventType.EXTERNAL_CALL, Severity.INFO, traceId,
+                "reserveStock", "Reserving stock for SKU catalog", Map.of("sku", "SKU-9901"));
+        ingestEvent("evt-3", t2, "inventory-service", EventType.DATABASE, Severity.FATAL, traceId,
+                "UPDATE inventory", "Database query timed out after 3000ms: Lock wait timeout exceeded",
+                Map.of("table", "inventory_locks", "timeoutMs", 3000));
+        // Explicit propagation error from order-service caused by inventory database failure
+        ingestEvent("evt-4", t3, "order-service", EventType.RESPONSE, Severity.ERROR, traceId,
+                "POST /api/orders", "Order placement failed with downstream database error 500: inventory-service timeout",
+                Map.of("httpStatus", 500));
+
+        // 2. Perform full failure analysis
+        FailureAnalysisResponse analysisResp = failureAnalysisService.analyzeTrace(traceId).response();
+
+        // 3. Inspect timeline
+        IncidentTimelineResponse timeline = timelineService.getTimeline(traceId);
+        assertThat(timeline.eventCount()).isEqualTo(4);
+        assertThat(timeline.failureCount()).isEqualTo(2);
+
+        // Database timeout remains root cause candidate at +800ms
+        assertThat(timeline.primaryServiceName()).isEqualTo("inventory-service");
+        assertThat(timeline.primaryEventId()).isEqualTo("evt-3");
+        var dbEntry = timeline.timeline().get(2);
+        assertThat(dbEntry.offsetMs()).isEqualTo(800L);
+        assertThat(dbEntry.entryCategory()).isEqualTo(IncidentEntryCategory.DATABASE_FAILURE);
+        assertThat(dbEntry.failurePropagation()).isFalse();
+
+        // Subsequent failure with explicit evidence IS classified as DOWNSTREAM_ERROR
+        var propEntry = timeline.timeline().get(3);
+        assertThat(propEntry.eventId()).isEqualTo("evt-4");
+        assertThat(propEntry.offsetMs()).isEqualTo(860L);
+        assertThat(propEntry.entryCategory()).isEqualTo(IncidentEntryCategory.DOWNSTREAM_ERROR);
+        assertThat(propEntry.failurePropagation()).isTrue();
+
+        // Top candidate in analysis is the database timeout
+        assertThat(analysisResp.candidates().get(0).candidateType()).isEqualTo(FailureCandidateType.DATABASE_FAILURE);
+        assertThat(analysisResp.candidates().get(0).eventId()).isEqualTo("evt-3");
+
+        // Second candidate is downstream failure
+        assertThat(analysisResp.candidates().get(1).candidateType()).isEqualTo(FailureCandidateType.DOWNSTREAM_FAILURE);
+        assertThat(analysisResp.candidates().get(1).eventId()).isEqualTo("evt-4");
     }
 }

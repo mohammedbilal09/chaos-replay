@@ -33,11 +33,13 @@ import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 import com.chaosreplay.metrics.ChaosReplayMetrics;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -213,7 +215,9 @@ public class IncidentTimelineService {
             if (eventFailed && firstFailure != null && !Objects.equals(event.getEventId(), firstFailure.getEventId())) {
                 boolean hasPropagationEvidence = evidenceRefs.stream()
                         .anyMatch(r -> r.contains("SERVICE_PROPAGATION") || r.contains("DOWNSTREAM_ERROR"));
-                if (hasPropagationEvidence || (matchedCandidate != null && matchedCandidate.getCandidateType() == FailureCandidateType.DOWNSTREAM_FAILURE)) {
+                if (hasPropagationEvidence
+                        || (matchedCandidate != null && matchedCandidate.getCandidateType() == FailureCandidateType.DOWNSTREAM_FAILURE)
+                        || hasPropagationSignal(event, firstFailure)) {
                     failurePropagation = true;
                 }
             }
@@ -319,18 +323,96 @@ public class IncidentTimelineService {
         if (event.getEventType() == EventType.EXTERNAL_CALL) {
             return IncidentEntryCategory.EXTERNAL_CALL_FAILURE;
         }
+        if (firstFailure != null && !Objects.equals(event.getEventId(), firstFailure.getEventId())
+                && !Objects.equals(event.getServiceName(), firstFailure.getServiceName())
+                && hasPropagationSignal(event, firstFailure)) {
+            return IncidentEntryCategory.DOWNSTREAM_ERROR;
+        }
         if (hasTimeoutSignal(event)) {
             return IncidentEntryCategory.TIMEOUT_SIGNAL;
-        }
-        if (firstFailure != null && !Objects.equals(event.getEventId(), firstFailure.getEventId())
-                && !Objects.equals(event.getServiceName(), firstFailure.getServiceName())) {
-            return IncidentEntryCategory.DOWNSTREAM_ERROR;
         }
         if (event.getSeverity() == Severity.FATAL) {
             return IncidentEntryCategory.FATAL_EVENT;
         }
 
         return IncidentEntryCategory.ERROR_EVENT;
+    }
+
+    private boolean hasPropagationSignal(TelemetryEvent event, TelemetryEvent firstFailure) {
+        return FailureAnalysisService.hasPropagationSignal(event, firstFailure);
+    }
+
+    /**
+     * Inspects whether cross-service request/response event ordering exhibits non-monotonic
+     * timestamps across services sharing the same request identifier.
+     *
+     * @param traceId distributed trace identifier
+     * @return true if causal timestamp anomaly is detected
+     */
+    @Transactional(readOnly = true)
+    public boolean hasCausalTimestampAnomaly(String traceId) {
+        if (traceId == null || traceId.isBlank()) {
+            return false;
+        }
+        List<TelemetryEvent> events = telemetryRepository
+                .findAllByTraceIdOrderByTimestampAscEventIdAsc(traceId.trim());
+        return detectCausalTimestampAnomalies(events);
+    }
+
+    /**
+     * Inspects a list of telemetry events for causal timestamp anomalies where a RESPONSE
+     * timestamp is reported earlier than its causative REQUEST or EXTERNAL_CALL within the
+     * same requestId and matching operation.
+     *
+     * @param events list of telemetry events
+     * @return true if an inverted causal timestamp relationship exists
+     */
+    public boolean detectCausalTimestampAnomalies(List<TelemetryEvent> events) {
+        if (events == null || events.size() < 2) {
+            return false;
+        }
+
+        // Group by requestId and normalized operation to ensure a defensible causal link
+        Map<String, List<TelemetryEvent>> byRequestAndOp = events.stream()
+                .filter(e -> e.getRequestId() != null && !e.getRequestId().isBlank()
+                        && e.getOperation() != null && !e.getOperation().isBlank())
+                .collect(Collectors.groupingBy(e ->
+                        e.getRequestId().trim() + "::" + e.getOperation().trim().toLowerCase(Locale.ROOT)));
+
+        for (List<TelemetryEvent> groupEvents : byRequestAndOp.values()) {
+            List<TelemetryEvent> requests = groupEvents.stream()
+                    .filter(e -> e.getEventType() == EventType.REQUEST || e.getEventType() == EventType.EXTERNAL_CALL)
+                    .sorted(Comparator.comparing(TelemetryEvent::getTimestamp).thenComparing(TelemetryEvent::getEventId))
+                    .toList();
+
+            List<TelemetryEvent> responses = groupEvents.stream()
+                    .filter(e -> e.getEventType() == EventType.RESPONSE)
+                    .sorted(Comparator.comparing(TelemetryEvent::getTimestamp).thenComparing(TelemetryEvent::getEventId))
+                    .toList();
+
+            if (requests.isEmpty() || responses.isEmpty()) {
+                continue;
+            }
+
+            Instant earliestRequest = requests.get(0).getTimestamp();
+
+            // 1. Any response occurring before the earliest request of this operation is an anomaly
+            for (TelemetryEvent res : responses) {
+                if (res.getTimestamp().isBefore(earliestRequest)) {
+                    return true;
+                }
+            }
+
+            // 2. If requests and responses match 1:1, check pairwise for causal inversion
+            if (requests.size() == responses.size()) {
+                for (int i = 0; i < requests.size(); i++) {
+                    if (responses.get(i).getTimestamp().isBefore(requests.get(i).getTimestamp())) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     private boolean isFailure(TelemetryEvent event) {

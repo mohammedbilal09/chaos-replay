@@ -500,4 +500,190 @@ class IncidentTimelineServiceTest {
         verify(verificationRepository, never()).save(any());
         verify(verificationRepository, never()).saveAndFlush(any());
     }
+
+    @Test
+    @DisplayName("17. Identical timestamps with deterministic event ID ordering")
+    void identicalTimestamps_deterministicEventIdOrdering() {
+        String traceId = "trace-identical-ts-01";
+        Instant t0 = Instant.parse("2026-10-18T10:00:00Z");
+
+        List<TelemetryEvent> events = List.of(
+                createEvent("evt-03", t0, "svc-c", EventType.REQUEST, Severity.INFO, traceId, "opC", "Msg", Map.of()),
+                createEvent("evt-01", t0, "svc-a", EventType.REQUEST, Severity.INFO, traceId, "opA", "Msg", Map.of()),
+                createEvent("evt-02", t0, "svc-b", EventType.REQUEST, Severity.INFO, traceId, "opB", "Msg", Map.of())
+        );
+
+        when(telemetryRepository.findAllByTraceIdOrderByTimestampAscEventIdAsc(traceId))
+                .thenReturn(List.of(events.get(1), events.get(2), events.get(0)));
+        when(analysisRepository.findFirstByTraceIdOrderByCreatedAtDesc(traceId)).thenReturn(Optional.empty());
+        when(scenarioRepository.findFirstBySourceTraceIdOrderByCreatedAtDesc(traceId)).thenReturn(Optional.empty());
+
+        IncidentTimelineResponse response = timelineService.getTimeline(traceId);
+
+        assertThat(response.timeline()).hasSize(3);
+        assertThat(response.timeline().get(0).eventId()).isEqualTo("evt-01");
+        assertThat(response.timeline().get(1).eventId()).isEqualTo("evt-02");
+        assertThat(response.timeline().get(2).eventId()).isEqualTo("evt-03");
+        assertThat(response.timeline().get(0).offsetMs()).isZero();
+        assertThat(response.timeline().get(1).offsetMs()).isZero();
+        assertThat(response.timeline().get(2).offsetMs()).isZero();
+    }
+
+    @Test
+    @DisplayName("18. Independent failures across services without propagation signals are not classified downstream")
+    void independentFailuresAcrossServices_doesNotClassifyDownstream() {
+        String traceId = "trace-indep-timeline-01";
+        Instant t0 = Instant.parse("2026-10-18T10:00:00Z");
+        Instant t1 = Instant.parse("2026-10-18T10:00:00.080Z");
+
+        List<TelemetryEvent> events = List.of(
+                createEvent("evt-1", t0, "billing-service", EventType.DATABASE, Severity.ERROR, traceId, "charge", "Database deadlock", Map.of()),
+                createEvent("evt-2", t1, "email-service", EventType.REQUEST, Severity.ERROR, traceId, "sendMail", "Failed to resolve SMTP host", Map.of())
+        );
+
+        when(telemetryRepository.findAllByTraceIdOrderByTimestampAscEventIdAsc(traceId)).thenReturn(events);
+        when(analysisRepository.findFirstByTraceIdOrderByCreatedAtDesc(traceId)).thenReturn(Optional.empty());
+        when(scenarioRepository.findFirstBySourceTraceIdOrderByCreatedAtDesc(traceId)).thenReturn(Optional.empty());
+
+        IncidentTimelineResponse response = timelineService.getTimeline(traceId);
+
+        assertThat(response.timeline().get(0).entryCategory()).isEqualTo(IncidentEntryCategory.DATABASE_FAILURE);
+        assertThat(response.timeline().get(0).failurePropagation()).isFalse();
+
+        // evt-2 is an independent failure in email-service without propagation evidence -> ERROR_EVENT, failurePropagation = false
+        assertThat(response.timeline().get(1).entryCategory()).isEqualTo(IncidentEntryCategory.ERROR_EVENT);
+        assertThat(response.timeline().get(1).failurePropagation()).isFalse();
+    }
+
+    @Test
+    @DisplayName("19. Downstream failure with explicit propagation evidence is categorized as DOWNSTREAM_ERROR")
+    void downstreamFailureWithPropagationSignal_categorizesDownstream() {
+        String traceId = "trace-prop-timeline-01";
+        Instant t0 = Instant.parse("2026-10-18T10:00:00Z");
+        Instant t1 = Instant.parse("2026-10-18T10:00:00.120Z");
+
+        List<TelemetryEvent> events = List.of(
+                createEvent("evt-1", t0, "inventory-service", EventType.DATABASE, Severity.FATAL, traceId, "reserve", "Deadlock", Map.of()),
+                createEvent("evt-2", t1, "order-service", EventType.RESPONSE, Severity.ERROR, traceId, "createOrder", "Order failed due to inventory-service downstream error", Map.of())
+        );
+
+        when(telemetryRepository.findAllByTraceIdOrderByTimestampAscEventIdAsc(traceId)).thenReturn(events);
+        when(analysisRepository.findFirstByTraceIdOrderByCreatedAtDesc(traceId)).thenReturn(Optional.empty());
+        when(scenarioRepository.findFirstBySourceTraceIdOrderByCreatedAtDesc(traceId)).thenReturn(Optional.empty());
+
+        IncidentTimelineResponse response = timelineService.getTimeline(traceId);
+
+        assertThat(response.timeline().get(0).entryCategory()).isEqualTo(IncidentEntryCategory.DATABASE_FAILURE);
+        assertThat(response.timeline().get(0).failurePropagation()).isFalse();
+
+        assertThat(response.timeline().get(1).entryCategory()).isEqualTo(IncidentEntryCategory.DOWNSTREAM_ERROR);
+        assertThat(response.timeline().get(1).failurePropagation()).isTrue();
+    }
+
+    @Test
+    @DisplayName("20. Causal timestamp anomaly detection flags inverted request/response ordering")
+    void detectCausalTimestampAnomalies_detectsInvertedResponseTimestamp() {
+        Instant t0 = Instant.parse("2026-10-18T10:00:00.100Z");
+        Instant tBefore = Instant.parse("2026-10-18T10:00:00.020Z"); // earlier timestamp due to clock skew!
+
+        TelemetryEvent req = new TelemetryEvent(
+                "evt-req", t0, "order-service", "node-1", EventType.REQUEST, Severity.INFO,
+                "trace-skew-01", "req-skew-01", "POST /orders", "Request received", Map.of()
+        );
+        TelemetryEvent res = new TelemetryEvent(
+                "evt-res", tBefore, "order-service", "node-1", EventType.RESPONSE, Severity.ERROR,
+                "trace-skew-01", "req-skew-01", "POST /orders", "Response returned", Map.of()
+        );
+
+        // Anomaly present: response timestamp is before request timestamp
+        boolean anomaly = timelineService.detectCausalTimestampAnomalies(List.of(req, res));
+        assertThat(anomaly).isTrue();
+
+        // Normal monotonic ordering: response timestamp after request timestamp
+        TelemetryEvent resNormal = new TelemetryEvent(
+                "evt-res-norm", Instant.parse("2026-10-18T10:00:00.150Z"), "order-service", "node-1", EventType.RESPONSE, Severity.INFO,
+                "trace-skew-01", "req-skew-01", "POST /orders", "Response returned", Map.of()
+        );
+        boolean normal = timelineService.detectCausalTimestampAnomalies(List.of(req, resNormal));
+        assertThat(normal).isFalse();
+    }
+
+    @Test
+    @DisplayName("21. Retries and multiple calls sharing requestId do not trigger false positive timestamp anomaly")
+    void detectCausalTimestampAnomalies_doesNotFalsePositiveOnRetries() {
+        // Attempt 1: req at 100ms, res at 120ms
+        TelemetryEvent req1 = new TelemetryEvent(
+                "evt-req-1", Instant.parse("2026-10-18T10:00:00.100Z"), "order-service", "node-1",
+                EventType.EXTERNAL_CALL, Severity.INFO, "trace-retry-01", "req-shared-01", "GET /inventory",
+                "Calling inventory attempt 1", Map.of()
+        );
+        TelemetryEvent res1 = new TelemetryEvent(
+                "evt-res-1", Instant.parse("2026-10-18T10:00:00.120Z"), "inventory-service", "node-2",
+                EventType.RESPONSE, Severity.WARN, "trace-retry-01", "req-shared-01", "GET /inventory",
+                "Temporary 503 response", Map.of()
+        );
+
+        // Attempt 2 (retry): req at 150ms, res at 170ms
+        // Under naive comparison (res1.timestamp < req2.timestamp = 120ms < 150ms), this would false-positive!
+        TelemetryEvent req2 = new TelemetryEvent(
+                "evt-req-2", Instant.parse("2026-10-18T10:00:00.150Z"), "order-service", "node-1",
+                EventType.EXTERNAL_CALL, Severity.INFO, "trace-retry-01", "req-shared-01", "GET /inventory",
+                "Calling inventory attempt 2", Map.of()
+        );
+        TelemetryEvent res2 = new TelemetryEvent(
+                "evt-res-2", Instant.parse("2026-10-18T10:00:00.170Z"), "inventory-service", "node-2",
+                EventType.RESPONSE, Severity.INFO, "trace-retry-01", "req-shared-01", "GET /inventory",
+                "Success response", Map.of()
+        );
+
+        boolean anomaly = timelineService.detectCausalTimestampAnomalies(List.of(req1, res1, req2, res2));
+        assertThat(anomaly).isFalse();
+    }
+
+    @Test
+    @DisplayName("22. Equal timestamps between request and response do not trigger causal anomaly")
+    void detectCausalTimestampAnomalies_equalTimestampsDoNotTriggerAnomaly() {
+        Instant sameInstant = Instant.parse("2026-10-18T10:00:00.100Z");
+        TelemetryEvent req = new TelemetryEvent(
+                "evt-req", sameInstant, "order-service", "node-1", EventType.REQUEST, Severity.INFO,
+                "trace-eq-01", "req-eq-01", "POST /orders", "Request received", Map.of()
+        );
+        TelemetryEvent res = new TelemetryEvent(
+                "evt-res", sameInstant, "order-service", "node-1", EventType.RESPONSE, Severity.INFO,
+                "trace-eq-01", "req-eq-01", "POST /orders", "Response returned same millisecond", Map.of()
+        );
+
+        boolean anomaly = timelineService.detectCausalTimestampAnomalies(List.of(req, res));
+        assertThat(anomaly).isFalse();
+    }
+
+    @Test
+    @DisplayName("23. Retried call with clock skew on second attempt is accurately detected")
+    void detectCausalTimestampAnomalies_skewOnSecondAttemptDetected() {
+        TelemetryEvent req1 = new TelemetryEvent(
+                "evt-req-1", Instant.parse("2026-10-18T10:00:00.100Z"), "order-service", "node-1",
+                EventType.EXTERNAL_CALL, Severity.INFO, "trace-retry-02", "req-shared-02", "GET /inventory",
+                "Calling inventory attempt 1", Map.of()
+        );
+        TelemetryEvent res1 = new TelemetryEvent(
+                "evt-res-1", Instant.parse("2026-10-18T10:00:00.120Z"), "inventory-service", "node-2",
+                EventType.RESPONSE, Severity.WARN, "trace-retry-02", "req-shared-02", "GET /inventory",
+                "Temporary 503 response", Map.of()
+        );
+
+        // Attempt 2: req at 200ms, but clock skewed node returns response stamped at 180ms (< 200ms)
+        TelemetryEvent req2 = new TelemetryEvent(
+                "evt-req-2", Instant.parse("2026-10-18T10:00:00.200Z"), "order-service", "node-1",
+                EventType.EXTERNAL_CALL, Severity.INFO, "trace-retry-02", "req-shared-02", "GET /inventory",
+                "Calling inventory attempt 2", Map.of()
+        );
+        TelemetryEvent res2 = new TelemetryEvent(
+                "evt-res-2", Instant.parse("2026-10-18T10:00:00.180Z"), "inventory-service", "node-skew",
+                EventType.RESPONSE, Severity.INFO, "trace-retry-02", "req-shared-02", "GET /inventory",
+                "Success response with clock skew", Map.of()
+        );
+
+        boolean anomaly = timelineService.detectCausalTimestampAnomalies(List.of(req1, res1, req2, res2));
+        assertThat(anomaly).isTrue();
+    }
 }

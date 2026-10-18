@@ -215,6 +215,12 @@ public class IncidentInvestigationService {
             limitations.add("Insufficient telemetry evidence to classify a specific root cause candidate.");
         }
 
+        limitations.add("Telemetry timestamps reflect producer host clocks without vector clocks or hardware synchronization metadata; relative offsets measure elapsed duration from the earliest recorded event but do not correct for inter-service clock skew.");
+
+        if (timelineService.hasCausalTimestampAnomaly(cleanTraceId)) {
+            limitations.add("Potential cross-service clock anomaly detected: causal request/response event ordering exhibits non-monotonic timestamps across services.");
+        }
+
         limitations.add("Analysis conclusions and candidates represent deterministic, evidence-backed correlations from observed telemetry and simulated replays; absolute real-world causality is not claimed.");
 
         long duration = System.nanoTime() - startNanos;
