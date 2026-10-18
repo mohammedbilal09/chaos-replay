@@ -6,7 +6,7 @@ ChaosReplay is designed to become an end-to-end distributed failure reconstructi
 
 ChaosReplay's long-term vision is to automatically ingest distributed runtime telemetry, correlate cross-service events into deterministic execution timelines, reconstruct production incidents into minimal reproducible failure scenarios, replay them inside isolated environments with deterministic fault injection, and verify candidate code fixes before production release.
 
-> **Note**: ChaosReplay is being developed in deliberate engineering phases. The current codebase implements **Phase 1 — Foundation**, **Phase 2 — Telemetry Ingestion**, **Phase 3 — Telemetry Correlation & Failure Reconstruction**, **Phase 4 — Deterministic Failure Replay & Scenario Generation**, **Phase 5 — Replay Verification & Failure Comparison**, and **Phase 6 — Deterministic Failure Analysis & Root-Cause Evidence**. Future capabilities (service dependency graphs, minimal reproduction engine, chaos injection, incident graphs, UI dashboards) will be built incrementally in subsequent phases.
+> **Note**: ChaosReplay is being developed in deliberate engineering phases. The current codebase implements **Phase 1 — Foundation**, **Phase 2 — Telemetry Ingestion**, **Phase 3 — Telemetry Correlation & Failure Reconstruction**, **Phase 4 — Deterministic Failure Replay & Scenario Generation**, **Phase 5 — Replay Verification & Failure Comparison**, **Phase 6 — Deterministic Failure Analysis & Root-Cause Evidence**, and **Phase 7 — Incident Timeline & Explainable Failure Insights**. Future capabilities (service dependency graphs, minimal reproduction engine, chaos injection, incident graphs, UI dashboards) will be built incrementally in subsequent phases.
 
 ---
 
@@ -23,11 +23,19 @@ Reproducing production bugs and catastrophic incidents in distributed systems is
 
 ## Current Status
 
-**Current Status: Phase 6 — Deterministic Failure Analysis & Root-Cause Evidence**
+**Current Status: Phase 7 — Incident Timeline & Explainable Failure Insights**
 
-Phase 6 transforms ChaosReplay from a system that verifies replay executions into an explainable, evidence-backed failure analysis platform:
+Phase 7 extends ChaosReplay with a deterministic, evidence-backed incident timeline and a consolidated investigation API without duplicating domain data or mutating existing records:
 
-> **"Why did the failure occur, which services and operations contributed, and what is the deterministic evidence supporting this conclusion?"**
+> **"What happened across the system in chronological order, where did the first failure originate, how did it propagate, what evidence explains candidate causes, and what remains uncertain?"**
+
+* **Read-Only Investigation Guarantee**: Strictly non-mutating query layer. Incident investigation endpoints never insert, update, or delete records, and never automatically trigger background scenario generation, replay execution, replay verification, or failure analysis.
+* **Deterministic Incident Timeline**: Assembles chronologically ordered events (`timestamp ASC`, `eventId ASC`), relative millisecond offsets (`offsetMs` from first event at `0ms`), explicit entry categories (`DATABASE_FAILURE`, `EXTERNAL_CALL_FAILURE`, `TIMEOUT_SIGNAL`, `DOWNSTREAM_ERROR`, `FATAL_EVENT`, `ERROR_EVENT`, `REPLAY_DIVERGENCE`, `NORMAL_EVENT`), failure flags, candidate ranks, and evidence references.
+* **Consolidated Investigation Model**: Aggregates the complete incident lifecycle across telemetry correlation, replay scenario generation, replay verification results/differences, failure analysis root-cause candidates, confidence scores, evidence summaries, and explicit limitations.
+* **Propagation & Divergence Grounding**: Flags `failurePropagation: true` only when backed by concrete downstream/propagation evidence. Annotates entries with replay divergences from verification differences.
+* **Missing & Clean Trace Transparency**: Clean traces return `failureObserved: false`, `rootCauseStatus: INSUFFICIENT_EVIDENCE`, `conclusion: NO_FAILURE_OBSERVED`, and `confidenceScore: 0.0`. Missing stages report `analysisAvailable: false`, `scenarioAvailable: false`, or `verificationAvailable: false` with explicit diagnostic limitations. Unknown traces return `404 Not Found`.
+* **Zero Database Migrations Required**: Purely computed read model aggregating existing immutable domain entities.
+* **Comprehensive Automated Tests**: 172 automated tests spanning unit tests (Mockito), MVC slice tests (`@WebMvcTest`), and real PostgreSQL 16 Testcontainers integration tests.
 
 * **Evidence-Only & Explainable**: ChaosReplay **never invents, guesses, or hallucinates** a root cause using LLMs or speculative heuristics. Every conclusion is strictly traceable to persisted `TelemetryEvent` records, `ReplayScenario` snapshots, and `ReplayVerificationDifference` records.
 * **Insufficient Evidence Guarantee**: If no failures occurred in a trace or evidence is lacking, the system returns `status: INSUFFICIENT_EVIDENCE` and `conclusion: NO_FAILURE_OBSERVED` with confidence score `0.0`.
@@ -95,6 +103,12 @@ flowchart TD
             AnalysisAPI["Failure Analysis Controller<br/>POST /api/v1/analysis/traces/{traceId}<br/>GET /api/v1/analysis/{analysisId}<br/>GET /api/v1/analysis/traces/{traceId}"]
             AnalysisSvc["Failure Analysis Service<br/>Deterministic Candidate & Evidence Engine"]
         end
+
+        subgraph IncidentLayer["Incident Timeline & Investigation Layer"]
+            IncidentAPI["Incident Controller<br/>GET /api/v1/incidents/traces/{traceId}/timeline<br/>GET /api/v1/incidents/traces/{traceId}"]
+            TimelineSvc["Incident Timeline Service<br/>Chronological Assembly & Relative Offsets"]
+            InvestigationSvc["Incident Investigation Service<br/>Consolidated Investigation & Limitations"]
+        end
         
         subgraph PersistenceLayer["Persistence Layer (Spring Data JPA + Flyway)"]
             RepoTelemetry["TelemetryEventRepository"]
@@ -135,6 +149,19 @@ flowchart TD
         AnalysisSvc --> RepoAnalysis
         AnalysisSvc --> RepoCandidate
         AnalysisSvc --> RepoEvidence
+
+        IncidentAPI --> TimelineSvc
+        IncidentAPI --> InvestigationSvc
+        InvestigationSvc --> TimelineSvc
+        TimelineSvc --> RepoTelemetry
+        TimelineSvc --> RepoAnalysis
+        TimelineSvc --> RepoCandidate
+        TimelineSvc --> RepoEvidence
+        TimelineSvc --> RepoVerify
+        TimelineSvc --> RepoVerifyDiff
+        InvestigationSvc --> RepoScenario
+        InvestigationSvc --> RepoVerify
+        InvestigationSvc --> RepoAnalysis
     end
     
     subgraph Storage["Database (PostgreSQL 16)"]
@@ -184,6 +211,157 @@ COMPLETED (ROOT_CAUSE_CANDIDATE | MULTIPLE_POSSIBLE_CAUSES)
   or INSUFFICIENT_EVIDENCE (NO_FAILURE_OBSERVED)
        ↓
 Immutable Analysis Persistence (PostgreSQL)
+```
+
+---
+
+## Incident Investigation & Timeline Endpoints (Phase 7)
+
+### 1. Retrieve Deterministic Incident Timeline
+Reconstructs an evidence-backed incident timeline ordered strictly by `timestamp ASC, eventId ASC` with relative offsets in milliseconds from the first observed event (`0 ms`).
+Correlates observed events with failure analysis root-cause candidates, supporting evidence, and verification differences. Strictly read-only and non-mutating.
+
+* **Endpoint**: `GET /api/v1/incidents/traces/{traceId}/timeline`
+* **Response Codes**: `200 OK`, `404 Not Found`
+
+**Example Request**:
+```bash
+curl -i http://localhost:8080/api/v1/incidents/traces/incident-trace-001/timeline
+```
+
+**Response (`200 OK`)**:
+```json
+{
+  "traceId": "incident-trace-001",
+  "eventCount": 3,
+  "failureCount": 2,
+  "failureObserved": true,
+  "firstEventAt": "2026-10-18T10:00:00Z",
+  "lastEventAt": "2026-10-18T10:00:00.120Z",
+  "durationMs": 120,
+  "analysisAvailable": true,
+  "verificationAvailable": true,
+  "rootCauseStatus": "COMPLETED",
+  "conclusion": "ROOT_CAUSE_CANDIDATE",
+  "primaryServiceName": "inventory-service",
+  "primaryEventId": "evt-02",
+  "confidenceScore": 0.9600,
+  "timeline": [
+    {
+      "sequenceNumber": 1,
+      "eventId": "evt-01",
+      "timestamp": "2026-10-18T10:00:00Z",
+      "offsetMs": 0,
+      "serviceName": "api-gateway",
+      "serviceInstance": null,
+      "eventType": "REQUEST",
+      "severity": "INFO",
+      "operation": "POST /checkout",
+      "message": "User initiated checkout",
+      "entryCategory": "NORMAL_EVENT",
+      "failureObserved": false,
+      "failurePropagation": false,
+      "relatedCandidateRank": null,
+      "evidenceReferences": []
+    },
+    {
+      "sequenceNumber": 2,
+      "eventId": "evt-02",
+      "timestamp": "2026-10-18T10:00:00.080Z",
+      "offsetMs": 80,
+      "serviceName": "inventory-service",
+      "serviceInstance": null,
+      "eventType": "DATABASE",
+      "severity": "ERROR",
+      "operation": "UPDATE stock",
+      "message": "Lock wait timeout exceeded",
+      "entryCategory": "DATABASE_FAILURE",
+      "failureObserved": true,
+      "failurePropagation": false,
+      "relatedCandidateRank": 1,
+      "evidenceReferences": ["FIRST_FAILURE", "TEMPORAL_PRECEDENCE", "ERROR_EVENT", "DATABASE_ERROR"]
+    },
+    {
+      "sequenceNumber": 3,
+      "eventId": "evt-03",
+      "timestamp": "2026-10-18T10:00:00.120Z",
+      "offsetMs": 120,
+      "serviceName": "order-service",
+      "serviceInstance": null,
+      "eventType": "REQUEST",
+      "severity": "ERROR",
+      "operation": "POST /orders",
+      "message": "Inventory reservation failed with error",
+      "entryCategory": "DOWNSTREAM_ERROR",
+      "failureObserved": true,
+      "failurePropagation": true,
+      "relatedCandidateRank": 2,
+      "evidenceReferences": ["ERROR_EVENT", "DOWNSTREAM_ERROR", "SERVICE_PROPAGATION", "TEMPORAL_PRECEDENCE"]
+    }
+  ],
+  "generatedAt": "2026-10-18T10:00:00Z"
+}
+```
+
+---
+
+### 2. Retrieve Consolidated Incident Investigation
+Aggregates the complete incident lifecycle into a unified investigation response:
+- Reconstructed timeline with relative millisecond offsets and semantic categories
+- Replay scenario execution status
+- Replay verification outcome, summary, and failure differences
+- Failure analysis root-cause candidates, confidence scores, and evidence links
+- Human-readable evidence summary narrative
+- Explicit diagnostic limitations for missing or partial stages
+Strictly read-only and non-mutating.
+
+* **Endpoint**: `GET /api/v1/incidents/traces/{traceId}`
+* **Response Codes**: `200 OK`, `404 Not Found`
+
+**Example Request**:
+```bash
+curl -i http://localhost:8080/api/v1/incidents/traces/incident-trace-001
+```
+
+**Response (`200 OK`)**:
+```json
+{
+  "traceId": "incident-trace-001",
+  "timeline": { ... },
+  "correlationAvailable": true,
+  "scenarioAvailable": true,
+  "scenarioId": "scen-ea0f04e52e2d285ae2808937c9f0189f",
+  "executionAvailable": true,
+  "executionStatus": "COMPLETED",
+  "verificationAvailable": true,
+  "verificationId": "verify-64b944c033c63df3fbb2eac14d2311f5",
+  "verificationStatus": "PASSED",
+  "verificationSummary": "Replay verified successfully: all 3 events matched original failure characteristics",
+  "analysisAvailable": true,
+  "analysisId": "analysis-8da3440a5f68579f81885b6455a916f1",
+  "analysisStatus": "COMPLETED",
+  "conclusion": "ROOT_CAUSE_CANDIDATE",
+  "confidenceScore": 0.9600,
+  "primaryServiceName": "inventory-service",
+  "primaryEventId": "evt-02",
+  "candidates": [ ... ],
+  "evidenceSummary": [
+    "Candidate #1 (DATABASE_FAILURE in inventory-service, confidence=0.9600): DATABASE_FAILURE in inventory-service at event evt-02. First failure observed in trace execution.",
+    "  - [FIRST_FAILURE] Earliest failure observed in trace execution at sequence #2",
+    "  - [TEMPORAL_PRECEDENCE] Event preceded all subsequent failures in trace",
+    "  - [ERROR_EVENT] Event logged with ERROR severity",
+    "  - [DATABASE_ERROR] Database operation reported failure: UPDATE stock",
+    "Candidate #2 (DOWNSTREAM_FAILURE in order-service, confidence=0.5800): DOWNSTREAM_FAILURE in order-service at event evt-03. Observed subsequently during trace execution.",
+    "  - [ERROR_EVENT] Event logged with ERROR severity",
+    "  - [DOWNSTREAM_ERROR] Failure occurred in downstream service after initial failure in inventory-service",
+    "  - [SERVICE_PROPAGATION] Potential downstream propagation from inventory-service to order-service",
+    "  - [TEMPORAL_PRECEDENCE] Event followed earlier failure event evt-02",
+    "Replay Verification (PASSED): Replay verified successfully: all 3 events matched original failure characteristics"
+  ],
+  "limitations": [
+    "Analysis conclusions and candidates represent deterministic, evidence-backed correlations from observed telemetry and simulated replays; absolute real-world causality is not claimed."
+  ]
+}
 ```
 
 ---
@@ -427,7 +605,7 @@ curl http://localhost:8080/api/v1/replay/scenarios/scen-02f5e6e297e2f440a066464a
 
 ## Automated Testing Suite
 
-Run the full automated test suite (134 tests including Testcontainers PostgreSQL integration tests):
+Run the full automated test suite (172 tests including Testcontainers PostgreSQL integration tests):
 
 ```bash
 ./mvnw clean test
@@ -435,6 +613,8 @@ Run the full automated test suite (134 tests including Testcontainers PostgreSQL
 
 ### Test Hierarchy:
 1. **Unit Tests**:
+   - `IncidentTimelineServiceTest`: 16 unit tests verifying timeline chronological ordering (`timestamp ASC`, `eventId ASC`), relative `offsetMs` calculation from 0ms, entry category classification, candidate rank & evidence linking, failure propagation grounding, verification divergence annotations, single-counted failures, idempotency, clean trace handling (`NO_FAILURE_OBSERVED`), and immutability guarantees.
+   - `IncidentInvestigationServiceTest`: 10 unit tests verifying complete investigation consolidation, missing component handling (`analysisAvailable: false`, `verificationAvailable: false`, `scenarioAvailable: false`), clean trace handling, human-readable evidence summaries, explicit limitations, and read-only behavior.
    - `FailureAnalysisServiceTest`: 18 unit tests verifying candidate cause classification (database, external dependency, timeout, application error, downstream failure), evidence attachment (first failure, temporal precedence, replay mismatch bonus, explicit metadata), deterministic tie-breaking, bounded confidence scoring, idempotent repeat retrieval, zero-failure clean trace handling (`INSUFFICIENT_EVIDENCE`), and immutability guarantees.
    - `ReplayVerificationServiceTest`: 16 unit tests covering PASSED, FAILED (missing events, unexpected events, severity mismatch, event type mismatch, service mismatch, failure count drift), PARTIAL (non-critical severity differences), deterministic SHA-256 ID consistency, idempotency, and scenario immutability.
    - `ReplayScenarioServiceTest`: Deterministic SHA-256 scenario ID generation, relative `offset_ms` computation, single-counted failure analysis, tie-breaking order preservation, and idempotency.
@@ -442,12 +622,14 @@ Run the full automated test suite (134 tests including Testcontainers PostgreSQL
    - `TraceCorrelationServiceTest`: Trace/request correlation and failure timeline reconstruction.
    - `TelemetryServiceTest`: Duplicate rejection, concurrency constraints, and query filtering.
 2. **Web Slice Tests (`@WebMvcTest`)**:
+   - `IncidentControllerTest`: 7 slice tests verifying `GET /api/v1/incidents/traces/{traceId}/timeline` and `GET /api/v1/incidents/traces/{traceId}` (200 OK, 404 for unknown traces, clean trace response, missing component response, and JSON field structures).
    - `FailureAnalysisControllerTest`: Verifies HTTP 201/200 idempotency, 404 handling for unknown analysis/trace, and analysis history listing.
    - `ReplayVerificationControllerTest`: Verifies HTTP 201/200 idempotency, 404 handling, and verification history listing.
    - `ReplayScenarioControllerTest`: HTTP 201/200 idempotency, 404 handling, and 409 conflict responses.
    - `TraceCorrelationControllerTest`, `RequestCorrelationControllerTest`, `TelemetryControllerTest`, `HealthControllerTest`, `ValidationTest`.
 3. **Real PostgreSQL Integration Tests (`@Testcontainers`)**:
-   - `FailureAnalysisPostgresIntegrationTest`: Verifies Flyway V4 migration, analysis persistence, candidate persistence, evidence persistence, foreign-key cascade deletion, unique constraints (`analysis_id` and `(analysis_id, rank)`), clean trace handling, and full end-to-end pipeline (Telemetry -> Ingestion -> Correlation -> Scenario Generation -> Execution -> Verification -> Failure Analysis) against live PostgreSQL 16.
+   - `IncidentPostgresIntegrationTest`: 5 integration tests against live PostgreSQL 16 verifying chronological ordering, relative offsets, candidate and evidence associations, optional component handling, clean traces, read-only guarantees (asserting zero row count changes across all database tables), and complete end-to-end lifecycle integration (Telemetry -> Correlation -> Scenario Generation -> Execution -> Verification -> Failure Analysis -> Incident Timeline & Investigation).
+   - `FailureAnalysisPostgresIntegrationTest`: Verifies Flyway V4 migration, analysis persistence, candidate persistence, evidence persistence, foreign-key cascade deletion, unique constraints (`analysis_id` and `(analysis_id, rank)`), clean trace handling, and full end-to-end pipeline against live PostgreSQL 16.
    - `ReplayVerificationPostgresIntegrationTest`: Verifies Flyway V3 migration, verification persistence, difference persistence, foreign-key cascade deletion, unique constraints, and end-to-end verification against live PostgreSQL 16.
    - `ReplayPostgresIntegrationTest`: Flyway V2 migrations, foreign keys, JSONB metadata persistence, sequence uniqueness constraints, and simulation lifecycle updates.
    - `CorrelationPostgresIntegrationTest`, `TelemetryPostgresIntegrationTest`.
@@ -476,11 +658,12 @@ docker build -t chaosreplay:latest .
 * **Phase 4 — Deterministic Failure Replay & Scenario Generation** *(Completed)*
 * **Phase 5 — Replay Verification & Failure Comparison** *(Completed)*
 * **Phase 6 — Deterministic Failure Analysis & Root-Cause Evidence** *(Completed)*
-* **Phase 7 — Service Dependency Graph** *(Upcoming)*
-* **Phase 8 — Minimal Reproduction Engine** *(Upcoming)*
-* **Phase 9 — Isolated Replay Engine** *(Upcoming)*
-* **Phase 10 — Chaos Injection** *(Upcoming)*
-* **Phase 11 — Candidate Fix Verification** *(Upcoming)*
-* **Phase 12 — Observability (OTel/Prometheus/Grafana)** *(Upcoming)*
-* **Phase 13 — Angular Incident Dashboard** *(Upcoming)*
-* **Phase 14 — Kubernetes/AWS Deployment** *(Upcoming)*
+* **Phase 7 — Incident Timeline & Explainable Failure Insights** *(Completed)*
+* **Phase 8 — Service Dependency Graph** *(Upcoming)*
+* **Phase 9 — Minimal Reproduction Engine** *(Upcoming)*
+* **Phase 10 — Isolated Replay Engine** *(Upcoming)*
+* **Phase 11 — Chaos Injection** *(Upcoming)*
+* **Phase 12 — Candidate Fix Verification** *(Upcoming)*
+* **Phase 13 — Observability (OTel/Prometheus/Grafana)** *(Upcoming)*
+* **Phase 14 — Angular Incident Dashboard** *(Upcoming)*
+* **Phase 15 — Kubernetes/AWS Deployment** *(Upcoming)*

@@ -44,5 +44,13 @@ public interface ReplayScenarioRepository extends JpaRepository<ReplayScenario, 
      * @return an Optional containing the earliest scenario for the trace
      */
     Optional<ReplayScenario> findFirstBySourceTraceIdOrderByCreatedAtAsc(String sourceTraceId);
+
+    /**
+     * Finds the latest replay scenario generated from a specific source trace ID.
+     *
+     * @param sourceTraceId distributed trace identifier
+     * @return an Optional containing the latest scenario for the trace
+     */
+    Optional<ReplayScenario> findFirstBySourceTraceIdOrderByCreatedAtDesc(String sourceTraceId);
 }
 

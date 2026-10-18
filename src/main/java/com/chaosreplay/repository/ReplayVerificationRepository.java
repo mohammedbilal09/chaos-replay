@@ -17,6 +17,8 @@ public interface ReplayVerificationRepository extends JpaRepository<ReplayVerifi
 
     List<ReplayVerification> findAllByScenarioIdOrderByCreatedAtDesc(String scenarioId);
 
+    Optional<ReplayVerification> findFirstByScenarioIdOrderByCreatedAtDesc(String scenarioId);
+
     boolean existsByVerificationId(String verificationId);
 }
 
