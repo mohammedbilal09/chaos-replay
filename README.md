@@ -6,7 +6,7 @@ ChaosReplay is designed to become an end-to-end distributed failure reconstructi
 
 ChaosReplay's long-term vision is to automatically ingest distributed runtime telemetry, correlate cross-service events into deterministic execution timelines, reconstruct production incidents into minimal reproducible failure scenarios, replay them inside isolated environments with deterministic fault injection, and verify candidate code fixes before production release.
 
-> **Note**: ChaosReplay is being developed in deliberate engineering phases. The current codebase implements **Phase 1 — Foundation**, **Phase 2 — Telemetry Ingestion**, **Phase 3 — Telemetry Correlation & Failure Reconstruction**, **Phase 4 — Deterministic Failure Replay & Scenario Generation**, **Phase 5 — Replay Verification & Failure Comparison**, **Phase 6 — Deterministic Failure Analysis & Root-Cause Evidence**, **Phase 7 — Incident Timeline & Explainable Failure Insights**, **Phase 8 — Event-Driven Telemetry Ingestion with Kafka**, and **Phase 9 — Performance, Caching & Observability**. Future capabilities (service dependency graphs, minimal reproduction engine, chaos injection, incident graphs, UI dashboards) will be built incrementally in subsequent phases.
+> **Note**: ChaosReplay is being developed in deliberate engineering phases. The current codebase implements **Phase 1 — Foundation**, **Phase 2 — Telemetry Ingestion**, **Phase 3 — Telemetry Correlation & Failure Reconstruction**, **Phase 4 — Deterministic Failure Replay & Scenario Generation**, **Phase 5 — Replay Verification & Failure Comparison**, **Phase 6 — Deterministic Failure Analysis & Root-Cause Evidence**, **Phase 7 — Incident Timeline & Explainable Failure Insights**, **Phase 8 — Event-Driven Telemetry Ingestion with Kafka**, **Phase 9 — Performance, Caching & Observability**, **Phase 10 — API Security & Reliability Hardening**, and **Phase 11 — Angular Incident Investigation Dashboard**. Future capabilities (service dependency graphs, minimal reproduction engine, chaos injection, incident graphs) will be built incrementally in subsequent phases.
 
 ---
 
@@ -23,9 +23,9 @@ Reproducing production bugs and catastrophic incidents in distributed systems is
 
 ## Current Status
 
-**Current Status: Phase 9 — Performance, Caching & Observability**
+**Current Status: Phase 11 — Angular Incident Investigation Dashboard**
 
-Phase 9 equips ChaosReplay with production-grade performance optimizations, index tuning, dimensional application metrics via Micrometer, robust health/readiness/liveness probes, structured operational logging, and rigorous bottleneck analysis:
+Phase 11 equips ChaosReplay with an interactive, production-grade Angular developer console (`frontend/`) connecting directly to the Spring Boot REST API for distributed incident investigation, chronological timeline visualization, evidence inspection, and deterministic replay verification.
 
 > **"How do we observe system throughput and latencies in real time, eliminate database query bottlenecks, expose enterprise-grade health checks without leaking infrastructure internals, and justify architectural caching decisions with concrete data?"**
 
@@ -953,6 +953,117 @@ When deploying ChaosReplay to a production environment:
 
 ---
 
+## Phase 11: Angular Incident Investigation Dashboard
+
+Phase 11 adds an interactive, production-grade Angular developer console in `frontend/` designed for distributed systems engineers and incident responders. It provides full visual investigation of distributed traces, chronological timelines with relative offsets, evidence-backed root-cause analysis, and deterministic replay verification.
+
+```
+frontend/
+├── src/
+│   ├── app/
+│   │   ├── core/
+│   │   │   ├── models/           # Domain contracts (incident, replay, health, api-error)
+│   │   │   └── services/         # Centralized ApiService with typed error translation
+│   │   ├── shared/
+│   │   │   ├── status-badge/     # Accessible badges with non-color glyphs & status styling
+│   │   │   ├── loading-skeleton/ # Shimmer loading placeholders
+│   │   │   └── error-alert/      # Structured error diagnostics with correlation ID & retry
+│   │   ├── features/
+│   │   │   ├── timeline/         # Chronological event feed, relative offsets, filter controls
+│   │   │   ├── evidence/         # Ranked root-cause candidates & evidence jumper
+│   │   │   ├── replay/           # Replay execution metrics & differences table
+│   │   │   └── incidents/        # Incident dashboard container & search stream
+│   │   ├── app.component.ts
+│   │   ├── app.config.ts         # provideHttpClient, provideRouter
+│   │   └── app.routes.ts
+│   ├── environments/             # Environment configs (development & production)
+│   ├── styles.css                # Dark developer-first typography, variables, & utility classes
+│   └── index.html
+├── proxy.conf.json               # Development reverse proxy targeting backend :8080
+├── angular.json
+├── package.json
+└── tsconfig.json
+```
+
+### 1. Key Capabilities
+
+* **Real-Time Backend Health Monitoring**: Visual connectivity pill checks `/api/v1/health` on load, reporting `UP` or `DOWN` without polling loops.
+* **Trace Search with Inflight Cancellation**: Sanitizes trace ID input (`^[a-zA-Z0-9-_.:]{1,64}$`), clears whitespace, and uses RxJS `switchMap` to cancel stale in-flight requests when a new search is initiated.
+* **Chronological Event Timeline**:
+  * Visualizes every correlated event with sequence numbers (`#1, #2...`) and exact relative offsets (`+0ms`, `+350ms`, `+1.50s`).
+  * Categorizes events with distinct visual markers: `🚨 First Failure`, `🎯 Root Cause`, `↳ Propagation`.
+  * Interactive filtering by severity (`All`, `Error & Fatal`, `Warn`, `Info`), service name, and text query (operation, message, event ID).
+  * Expandable technical metadata inspector for raw timestamps, service instances, and millisecond offsets.
+* **Evidence-Backed Root Cause Panel**:
+  * Hypothesis card showing analysis conclusion, confidence score gauge (`0% - 100%`), and primary failing service.
+  * Ranked candidate cards sorted deterministically with supporting telemetry evidence.
+  * Direct "Jump to Event" links that switch to the timeline tab, highlight the matching row, and smoothly scroll into view.
+  * Explicit limitations section surfacing incomplete data or black-box dependencies.
+* **Deterministic Replay Verification View**:
+  * Displays execution status and verification verdict (`PASSED`, `FAILED`, `PARTIAL`, `SKIPPED`).
+  * Comparative metrics grid: Events Matched, Events Missing, Events Unexpected, Severity Mismatches, Service Mismatches, and Duration Drift.
+  * Discrepancy table detailing sequence numbers, expected vs. actual values, and diagnostic messages.
+  * Honest disclosure card when verification has not yet been executed for a trace.
+* **Accessible & Resilient Error Handling**:
+  * Error alerts display HTTP status, business `errorCode`, correlation ID, validation field details, and a 1-click retry button.
+  * Status badges incorporate textual and glyph cues (`✖`, `⚡`, `▲`, `✔`, `ℹ`, `🎯`, `🚨`, `↳`) ensuring status is never communicated by color alone.
+
+### 2. Development Setup & Proxy Configuration
+
+During local development, Angular CLI runs on port 4200 and proxies `/api` and `/actuator` requests to the Spring Boot backend on port 8080. This allows development without relaxing backend CORS restrictions.
+
+```json
+{
+  "/api": {
+    "target": "http://localhost:8080",
+    "secure": false,
+    "changeOrigin": true
+  },
+  "/actuator": {
+    "target": "http://localhost:8080",
+    "secure": false,
+    "changeOrigin": true
+  }
+}
+```
+
+### 3. Running the Dashboard
+
+#### Prerequisites
+* Node.js: `v20.x` or later (tested on `v26.11.0`)
+* npm: `v10.x` or later (tested on `11.20.0`)
+* Java 21 & Maven Wrapper (for backend)
+
+#### Start Backend:
+```bash
+./mvnw spring-boot:run
+```
+
+#### Start Frontend Development Server:
+```bash
+cd frontend
+npm install
+npm start
+```
+The frontend application will be accessible at: `http://localhost:4200`
+
+### 4. Running Frontend Tests & Production Build
+
+#### Run Karma Unit Tests (Headless):
+```bash
+cd frontend
+npm test -- --watch=false --browsers=ChromeHeadless
+```
+
+#### Production Build:
+```bash
+cd frontend
+npm run build
+```
+The production bundle is generated in `frontend/dist/frontend`.
+
+---
+
 ## Packaging & Docker
 
 ### Package JAR:
@@ -979,10 +1090,10 @@ docker build -t chaosreplay:latest .
 * **Phase 8 — Event-Driven Telemetry Ingestion with Kafka** *(Completed)*
 * **Phase 9 — Performance, Caching & Observability** *(Completed)*
 * **Phase 10 — API Security & Reliability Hardening** *(Completed)*
-* **Phase 11 — Service Dependency Graph** *(Upcoming)*
-* **Phase 12 — Minimal Reproduction Engine** *(Upcoming)*
-* **Phase 13 — Isolated Replay Engine** *(Upcoming)*
-* **Phase 14 — Chaos Injection** *(Upcoming)*
-* **Phase 15 — Candidate Fix Verification** *(Upcoming)*
-* **Phase 16 — Angular Incident Dashboard** *(Upcoming)*
+* **Phase 11 — Angular Incident Investigation Dashboard** *(Completed)*
+* **Phase 12 — Service Dependency Graph** *(Upcoming)*
+* **Phase 13 — Minimal Reproduction Engine** *(Upcoming)*
+* **Phase 14 — Isolated Replay Engine** *(Upcoming)*
+* **Phase 15 — Chaos Injection** *(Upcoming)*
+* **Phase 16 — Candidate Fix Verification** *(Upcoming)*
 * **Phase 17 — Kubernetes/AWS Deployment** *(Upcoming)*
