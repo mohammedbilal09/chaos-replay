@@ -5,6 +5,24 @@ spring:
     default: local
   jpa:
     open-in-view: false
+  kafka:
+    bootstrap-servers: ${chaosreplay.kafka.bootstrap-servers}
+    consumer:
+      group-id: ${chaosreplay.kafka.consumer-group}
+      auto-offset-reset: ${chaosreplay.kafka.auto-offset-reset}
+
+chaosreplay:
+  kafka:
+    enabled: ${CHAOSREPLAY_KAFKA_ENABLED:true}
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    telemetry-topic: ${CHAOSREPLAY_KAFKA_TOPIC:chaosreplay.telemetry}
+    dlq-topic: ${CHAOSREPLAY_KAFKA_DLQ_TOPIC:chaosreplay.telemetry.dlq}
+    consumer-group: ${CHAOSREPLAY_KAFKA_CONSUMER_GROUP:chaosreplay-telemetry-group}
+    consumer-concurrency: ${CHAOSREPLAY_KAFKA_CONCURRENCY:1}
+    auto-offset-reset: earliest
+    retry:
+      max-attempts: ${CHAOSREPLAY_KAFKA_RETRY_MAX_ATTEMPTS:3}
+      backoff-ms: ${CHAOSREPLAY_KAFKA_RETRY_BACKOFF_MS:1000}
 
 management:
   endpoints:

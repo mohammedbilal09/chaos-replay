@@ -6,7 +6,7 @@ ChaosReplay is designed to become an end-to-end distributed failure reconstructi
 
 ChaosReplay's long-term vision is to automatically ingest distributed runtime telemetry, correlate cross-service events into deterministic execution timelines, reconstruct production incidents into minimal reproducible failure scenarios, replay them inside isolated environments with deterministic fault injection, and verify candidate code fixes before production release.
 
-> **Note**: ChaosReplay is being developed in deliberate engineering phases. The current codebase implements **Phase 1 — Foundation**, **Phase 2 — Telemetry Ingestion**, **Phase 3 — Telemetry Correlation & Failure Reconstruction**, **Phase 4 — Deterministic Failure Replay & Scenario Generation**, **Phase 5 — Replay Verification & Failure Comparison**, **Phase 6 — Deterministic Failure Analysis & Root-Cause Evidence**, and **Phase 7 — Incident Timeline & Explainable Failure Insights**. Future capabilities (service dependency graphs, minimal reproduction engine, chaos injection, incident graphs, UI dashboards) will be built incrementally in subsequent phases.
+> **Note**: ChaosReplay is being developed in deliberate engineering phases. The current codebase implements **Phase 1 — Foundation**, **Phase 2 — Telemetry Ingestion**, **Phase 3 — Telemetry Correlation & Failure Reconstruction**, **Phase 4 — Deterministic Failure Replay & Scenario Generation**, **Phase 5 — Replay Verification & Failure Comparison**, **Phase 6 — Deterministic Failure Analysis & Root-Cause Evidence**, **Phase 7 — Incident Timeline & Explainable Failure Insights**, and **Phase 8 — Event-Driven Telemetry Ingestion with Kafka**. Future capabilities (service dependency graphs, minimal reproduction engine, chaos injection, incident graphs, UI dashboards) will be built incrementally in subsequent phases.
 
 ---
 
@@ -23,11 +23,18 @@ Reproducing production bugs and catastrophic incidents in distributed systems is
 
 ## Current Status
 
-**Current Status: Phase 7 — Incident Timeline & Explainable Failure Insights**
+**Current Status: Phase 8 — Event-Driven Telemetry Ingestion with Kafka**
 
-Phase 7 extends ChaosReplay with a deterministic, evidence-backed incident timeline and a consolidated investigation API without duplicating domain data or mutating existing records:
+Phase 8 extends ChaosReplay with asynchronous, event-driven telemetry ingestion using Apache Kafka and Spring Kafka, while strictly preserving existing REST ingestion, PostgreSQL persistence, telemetry validation, event identity, duplicate handling, and trace correlation behavior:
 
-> **"What happened across the system in chronological order, where did the first failure originate, how did it propagate, what evidence explains candidate causes, and what remains uncertain?"**
+> **"How do we ingest high-throughput distributed telemetry asynchronously, reliably handle network/broker retries, enforce consumer idempotency, isolate poisoned messages to a dead-letter queue, and seamlessly feed into incident correlation and reconstruction?"**
+
+* **Dual Ingestion Paths**: Telemetry can be ingested via the synchronous REST API (`POST /api/v1/telemetry/events`) or asynchronously via Apache Kafka (`chaosreplay.telemetry` topic) with identical validation, persistence, and correlation semantics.
+* **Database-Grounded Idempotency**: Duplicate Kafka messages (same `eventId`) are cleanly absorbed by the application and database layers as successful no-ops without creating duplicate database rows; offsets are committed immediately without infinite retry loops or false DLQ routing.
+* **Bounded Retries & Dead-Letter Queue (DLQ)**: Ephemeral failures (network blips, temporary database unavailability) trigger bounded retries with fixed backoff (1000ms, max 3 attempts). Poison pills and unrecoverable malformed messages (JSON syntax errors, schema violations, invalid enums) are immediately routed to `chaosreplay.telemetry.dlq` with diagnostic error headers (`kafka_dlt-*`) without blocking partition processing.
+* **Clean Configuration Toggle**: Kafka consumer and producer infrastructure is driven by `chaosreplay.kafka.*` configuration properties and can be safely toggled via `chaosreplay.kafka.enabled` (disabled by default in test profiles).
+* **Official KRaft Broker**: Pinned Apache Kafka 3.8.1 in KRaft mode (no ZooKeeper dependency) configured in `docker-compose.yml` with health checks and volume persistence.
+* **Comprehensive Automated Tests**: 194 automated tests spanning unit tests (Mockito), MVC slice tests (`@WebMvcTest`), real PostgreSQL 16 Testcontainers integration tests, and live Kafka Testcontainers integration tests.
 
 * **Read-Only Investigation Guarantee**: Strictly non-mutating query layer. Incident investigation endpoints never insert, update, or delete records, and never automatically trigger background scenario generation, replay execution, replay verification, or failure analysis.
 * **Deterministic Incident Timeline**: Assembles chronologically ordered events (`timestamp ASC`, `eventId ASC`), relative millisecond offsets (`offsetMs` from first event at `0ms`), explicit entry categories (`DATABASE_FAILURE`, `EXTERNAL_CALL_FAILURE`, `TIMEOUT_SIGNAL`, `DOWNSTREAM_ERROR`, `FATAL_EVENT`, `ERROR_EVENT`, `REPLAY_DIVERGENCE`, `NORMAL_EVENT`), failure flags, candidate ranks, and evidence references.
@@ -70,17 +77,23 @@ Phase 7 extends ChaosReplay with a deterministic, evidence-backed incident timel
 
 ## Architecture
 
-The end-to-end processing pipeline in Phase 6 is:
+The end-to-end processing pipeline in Phase 8 is:
 
 ```mermaid
 flowchart TD
     TelemetryProducer["Telemetry Producer / Microservices"]
+
+    subgraph Messaging["Message Broker (Apache Kafka 3.8.1)"]
+        TopicMain["chaosreplay.telemetry<br/>Telemetry Event Stream"]
+        TopicDLQ["chaosreplay.telemetry.dlq<br/>Dead-Letter Queue (Malformed/Poison Records)"]
+    end
     
     subgraph SpringBootApp["ChaosReplay Platform (port 8080)"]
         direction TB
-        subgraph IngestionLayer["Ingestion Layer"]
+        subgraph IngestionLayer["Dual Ingestion Layer"]
             TelemetryAPI["Telemetry Controller<br/>POST /api/v1/telemetry/events<br/>GET /api/v1/telemetry/events"]
-            TelemetrySvc["Telemetry Ingestion Service"]
+            KafkaConsumer["Telemetry Kafka Consumer<br/>@KafkaListener (chaosreplay-telemetry-group)<br/>Idempotent & DLQ Recoverer"]
+            TelemetrySvc["Telemetry Ingestion Service<br/>Validation & Duplicate Protection"]
         end
         
         subgraph CorrelationLayer["Correlation & Reconstruction Layer"]
@@ -122,6 +135,8 @@ flowchart TD
         end
         
         TelemetryAPI --> TelemetrySvc
+        KafkaConsumer --> TelemetrySvc
+        KafkaConsumer -.->|"Poison/Malformed"| TopicDLQ
         TelemetrySvc --> RepoTelemetry
         
         TraceAPI --> CorrelationSvc
@@ -176,6 +191,8 @@ flowchart TD
     end
     
     TelemetryProducer -->|"POST Telemetry"| TelemetryAPI
+    TelemetryProducer -->|"Produce Record"| TopicMain
+    TopicMain -->|"Consume Record"| KafkaConsumer
     RepoTelemetry --> TableTelemetry
     RepoScenario --> TableScenarios
     RepoScenarioEvent --> TableScenarioEvents
@@ -211,6 +228,96 @@ COMPLETED (ROOT_CAUSE_CANDIDATE | MULTIPLE_POSSIBLE_CAUSES)
   or INSUFFICIENT_EVIDENCE (NO_FAILURE_OBSERVED)
        ↓
 Immutable Analysis Persistence (PostgreSQL)
+```
+
+---
+
+## Event-Driven Telemetry Ingestion with Kafka (Phase 8)
+
+Phase 8 introduces production-grade asynchronous, event-driven telemetry ingestion using Apache Kafka alongside the existing REST API. Telemetry produced by distributed services can stream directly into Kafka, where ChaosReplay consumes, validates, deduplicates, and persists events into PostgreSQL for trace correlation and failure analysis.
+
+### 1. Kafka Architecture & Topics
+
+| Topic | Purpose | Key | Content |
+|---|---|---|---|
+| `chaosreplay.telemetry` | Primary telemetry ingestion topic | `eventId` (UUID string) | UTF-8 JSON encoded `TelemetryMessage` |
+| `chaosreplay.telemetry.dlq` | Dead-letter queue for malformed / poison records | Original key or null | Raw unparseable/invalid payload with diagnostic `kafka_dlt-*` headers |
+
+### 2. Telemetry Message Contract
+
+Kafka records consumed from `chaosreplay.telemetry` conform to the following contract (validated via Jakarta Bean Validation):
+
+```json
+{
+  "eventId": "e8a10000-0000-0000-0000-000000000002",
+  "timestamp": "2026-10-18T10:00:00Z",
+  "traceId": "trace-kafka-001",
+  "spanId": "span-001",
+  "serviceName": "order-service",
+  "serviceInstance": "order-pod-a",
+  "eventType": "REQUEST",
+  "severity": "INFO",
+  "operationName": "POST /orders",
+  "payload": {
+    "amount": 250,
+    "currency": "USD"
+  }
+}
+```
+
+* **Contract Compatibility**: `TelemetryMessage` seamlessly maps to the internal `CreateTelemetryEventRequest`. Supported `eventType` enums: `REQUEST`, `RESPONSE`, `DATABASE`, `EXTERNAL_CALL`, `LOG`, `ERROR`. Supported `severity` enums: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`.
+
+### 3. Reliability, Idempotency & Poison Pill Isolation
+
+* **Database-Grounded Idempotency**: In distributed networks, at-least-once delivery often leads to duplicate messages. When a duplicate `eventId` is encountered, `TelemetryService` rejects it with `DuplicateEventException`. The Kafka consumer catches this exception, logs a structured warning, and commits the offset cleanly as a successful no-op. It never rethrows, never retries duplicates, and never pollutes the DLQ with valid duplicate events.
+* **Non-Retryable Exceptions**: Malformed JSON strings, schema validation failures, and unparseable enums are classified as `InvalidTelemetryMessageException` and immediately forwarded to `chaosreplay.telemetry.dlq` via Spring Kafka's `DeadLetterPublishingRecoverer` with the following diagnostic headers:
+  * `kafka_dlt-original-topic`
+  * `kafka_dlt-original-partition`
+  * `kafka_dlt-original-offset`
+  * `kafka_dlt-exception-fqcn`
+  * `kafka_dlt-exception-message`
+  * `kafka_dlt-exception-stacktrace`
+* **Transient Retries**: Temporary infrastructure failures (e.g., database connection pool exhaustion) trigger bounded retries (fixed backoff: 1000ms, max 3 attempts) before failing over to DLQ.
+
+### 4. Configuration Properties
+
+Driven by strongly-typed `KafkaTelemetryProperties` (`chaosreplay.kafka.*`):
+
+```yaml
+chaosreplay:
+  kafka:
+    enabled: true
+    bootstrap-servers: localhost:9092
+    topic: chaosreplay.telemetry
+    dlq-topic: chaosreplay.telemetry.dlq
+    consumer-group: chaosreplay-telemetry-group
+    retry:
+      max-attempts: 3
+      backoff-interval-ms: 1000
+```
+
+### 5. Docker Compose & Local Verification
+
+Start the required infrastructure (PostgreSQL 16 and Apache Kafka 3.8.1 in KRaft mode):
+
+```bash
+docker compose up -d postgres kafka
+```
+
+Produce a telemetry message using the Kafka console producer inside the container:
+
+```bash
+docker exec -i chaosreplay-kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic chaosreplay.telemetry << 'EOF'
+{"eventId":"e8a10000-0000-0000-0000-000000000002","timestamp":"2026-10-18T10:00:00Z","traceId":"trace-kafka-001","serviceName":"order-service","eventType":"REQUEST","severity":"INFO"}
+EOF
+```
+
+Query the correlated trace via REST:
+
+```bash
+curl http://localhost:8080/api/v1/traces/trace-kafka-001
 ```
 
 ---
@@ -605,7 +712,7 @@ curl http://localhost:8080/api/v1/replay/scenarios/scen-02f5e6e297e2f440a066464a
 
 ## Automated Testing Suite
 
-Run the full automated test suite (172 tests including Testcontainers PostgreSQL integration tests):
+Run the full automated test suite (194 tests including Testcontainers PostgreSQL and Kafka integration tests):
 
 ```bash
 ./mvnw clean test
@@ -613,6 +720,9 @@ Run the full automated test suite (172 tests including Testcontainers PostgreSQL
 
 ### Test Hierarchy:
 1. **Unit Tests**:
+   - `TelemetryKafkaConsumerTest`: 7 unit tests verifying message consumption, Jackson deserialization, Jakarta validation delegation to `TelemetryService`, idempotency duplicate absorption (catching `DuplicateEventException` and committing offset cleanly), and non-retryable exception routing.
+   - `TelemetryKafkaProducerTest`: 4 unit tests verifying message publishing with `eventId` key, synchronous/asynchronous sending, headers, and raw string publishing.
+   - `TelemetryMessageTest`: 3 unit tests verifying contract validation constraints (missing fields, blank strings) and conversion round-trips to/from `CreateTelemetryEventRequest`.
    - `IncidentTimelineServiceTest`: 16 unit tests verifying timeline chronological ordering (`timestamp ASC`, `eventId ASC`), relative `offsetMs` calculation from 0ms, entry category classification, candidate rank & evidence linking, failure propagation grounding, verification divergence annotations, single-counted failures, idempotency, clean trace handling (`NO_FAILURE_OBSERVED`), and immutability guarantees.
    - `IncidentInvestigationServiceTest`: 10 unit tests verifying complete investigation consolidation, missing component handling (`analysisAvailable: false`, `verificationAvailable: false`, `scenarioAvailable: false`), clean trace handling, human-readable evidence summaries, explicit limitations, and read-only behavior.
    - `FailureAnalysisServiceTest`: 18 unit tests verifying candidate cause classification (database, external dependency, timeout, application error, downstream failure), evidence attachment (first failure, temporal precedence, replay mismatch bonus, explicit metadata), deterministic tie-breaking, bounded confidence scoring, idempotent repeat retrieval, zero-failure clean trace handling (`INSUFFICIENT_EVIDENCE`), and immutability guarantees.
@@ -627,7 +737,16 @@ Run the full automated test suite (172 tests including Testcontainers PostgreSQL
    - `ReplayVerificationControllerTest`: Verifies HTTP 201/200 idempotency, 404 handling, and verification history listing.
    - `ReplayScenarioControllerTest`: HTTP 201/200 idempotency, 404 handling, and 409 conflict responses.
    - `TraceCorrelationControllerTest`, `RequestCorrelationControllerTest`, `TelemetryControllerTest`, `HealthControllerTest`, `ValidationTest`.
-3. **Real PostgreSQL Integration Tests (`@Testcontainers`)**:
+3. **Real PostgreSQL & Kafka Integration Tests (`@Testcontainers`)**:
+   - `TelemetryKafkaIntegrationTest`: 8 integration tests against live PostgreSQL 16 and live Apache Kafka 3.8.1 verifying:
+     - End-to-end event-driven telemetry ingestion via Kafka topic.
+     - Database persistence and subsequent REST trace correlation.
+     - Multi-event message ingestion preserving chronological order and trace correlation.
+     - Full incident timeline assembly from Kafka-streamed failure events.
+     - Application-level consumer idempotency (duplicate Kafka messages absorbed cleanly without duplicate database records).
+     - DLQ routing for unparseable malformed JSON strings (`chaosreplay.telemetry.dlq`).
+     - DLQ routing for schema validation constraint failures.
+     - DLQ routing for invalid domain enum values (`eventType`, `severity`).
    - `IncidentPostgresIntegrationTest`: 5 integration tests against live PostgreSQL 16 verifying chronological ordering, relative offsets, candidate and evidence associations, optional component handling, clean traces, read-only guarantees (asserting zero row count changes across all database tables), and complete end-to-end lifecycle integration (Telemetry -> Correlation -> Scenario Generation -> Execution -> Verification -> Failure Analysis -> Incident Timeline & Investigation).
    - `FailureAnalysisPostgresIntegrationTest`: Verifies Flyway V4 migration, analysis persistence, candidate persistence, evidence persistence, foreign-key cascade deletion, unique constraints (`analysis_id` and `(analysis_id, rank)`), clean trace handling, and full end-to-end pipeline against live PostgreSQL 16.
    - `ReplayVerificationPostgresIntegrationTest`: Verifies Flyway V3 migration, verification persistence, difference persistence, foreign-key cascade deletion, unique constraints, and end-to-end verification against live PostgreSQL 16.
@@ -659,11 +778,12 @@ docker build -t chaosreplay:latest .
 * **Phase 5 — Replay Verification & Failure Comparison** *(Completed)*
 * **Phase 6 — Deterministic Failure Analysis & Root-Cause Evidence** *(Completed)*
 * **Phase 7 — Incident Timeline & Explainable Failure Insights** *(Completed)*
-* **Phase 8 — Service Dependency Graph** *(Upcoming)*
-* **Phase 9 — Minimal Reproduction Engine** *(Upcoming)*
-* **Phase 10 — Isolated Replay Engine** *(Upcoming)*
-* **Phase 11 — Chaos Injection** *(Upcoming)*
-* **Phase 12 — Candidate Fix Verification** *(Upcoming)*
-* **Phase 13 — Observability (OTel/Prometheus/Grafana)** *(Upcoming)*
-* **Phase 14 — Angular Incident Dashboard** *(Upcoming)*
-* **Phase 15 — Kubernetes/AWS Deployment** *(Upcoming)*
+* **Phase 8 — Event-Driven Telemetry Ingestion with Kafka** *(Completed)*
+* **Phase 9 — Service Dependency Graph** *(Upcoming)*
+* **Phase 10 — Minimal Reproduction Engine** *(Upcoming)*
+* **Phase 11 — Isolated Replay Engine** *(Upcoming)*
+* **Phase 12 — Chaos Injection** *(Upcoming)*
+* **Phase 13 — Candidate Fix Verification** *(Upcoming)*
+* **Phase 14 — Observability (OTel/Prometheus/Grafana)** *(Upcoming)*
+* **Phase 15 — Angular Incident Dashboard** *(Upcoming)*
+* **Phase 16 — Kubernetes/AWS Deployment** *(Upcoming)*
